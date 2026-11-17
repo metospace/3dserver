@@ -1,5 +1,9 @@
-export const appVersion = '1.1.2'
+export const appVersion = '1.1.3'
 export const releases = [
+  { version: '1.1.3', date: '2026-11-17', title: '统一日夜主题开关', changes: [
+    '登录页、工作区和设置页统一使用太阳／月亮胶囊滑块，支持键盘切换和偏好保存。',
+    '移除主题下拉选择器和旧单图标按钮。',
+  ] },
   { version: '1.1.2', date: '2026-11-17', title: '大模型、缩略图与说明修复', changes: [
     'GLB 上限提高至 512 MB，模型传输与解码允许较长处理时间；看板限制保持不变。',
     '修正 BIN 大于声明缓冲区时的误拦，仍拒绝截断和越界引用。',

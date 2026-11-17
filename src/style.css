@@ -1552,25 +1552,7 @@ button:focus-visible,a:focus-visible {
     text-align:center
   }
 }
-.theme-switch {
-  display:inline-flex;
-  align-items:center;
-  gap:8px;
-  flex-shrink:0;
-  color:var(--muted);
-  font-size:11px;
-  white-space:nowrap
-}
-.theme-switch select {
-  width:auto;
-  max-width:120px;
-  padding:6px 9px;
-  border-radius:6px;
-  background:var(--input-subtle);
-  color:var(--text-secondary);
-  font-size:11px
-}
-.auth-panel>.theme-switch {
+.auth-panel>.theme-toggle {
   position:absolute;
   top:24px;
   right:28px
@@ -1583,25 +1565,15 @@ button:focus-visible,a:focus-visible {
     gap:7px;
     font-size:11px
   }
-  .topbar .theme-switch {
-    gap:5px
-  }
-  .topbar .theme-switch select {
-    max-width:100px;
-    padding:5px 6px
-  }
   .auth-panel {
     padding-top:78px
   }
-  .auth-panel>.theme-switch {
+  .auth-panel>.theme-toggle {
     top:20px;
     right:24px
   }
 }
 @media(max-width:380px) {
-  .topbar .theme-switch>span {
-    display:none
-  }
   .breadcrumb {
     gap:5px
   }
