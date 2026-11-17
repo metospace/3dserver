@@ -1,5 +1,6 @@
 import { open, readFile } from 'node:fs/promises';
 import { inflateSync } from 'node:zlib';
+import { MODEL_MAX_BYTES, MODEL_MAX_MB } from '../src/limits.js';
 
 export class HttpError extends Error {
   constructor(public readonly status: number, message: string,
@@ -40,13 +41,17 @@ export function originalFilename(value: string): string {
 }
 
 export async function validateGlb(filename: string, size: number): Promise<void> {
-  if (size < 20 || size > 100 * 1024 * 1024) throw new HttpError(400, 'GLB 文件必须大于 20 字节且不超过 100 MB');
+  if (!Number.isSafeInteger(size) || size < 20 || size > MODEL_MAX_BYTES) throw new HttpError(400, `GLB 文件必须至少为 20 字节且不超过 ${MODEL_MAX_MB} MiB（实际 ${size} 字节）`);
   const handle = await open(filename, 'r');
   try {
+    const actualSize = (await handle.stat()).size;
+    if (actualSize !== size) throw new HttpError(400, `GLB 文件长度不符：上传报告 ${size} 字节，磁盘实际 ${actualSize} 字节，文件可能已截断`);
     const header = Buffer.alloc(12);
-    if ((await handle.read(header, 0, 12, 0)).bytesRead !== 12 || header.readUInt32LE(0) !== 0x46546c67 || header.readUInt32LE(4) !== 2 || header.readUInt32LE(8) !== size) {
-      throw new HttpError(400, '文件不是有效的 GLB 2.0，或声明长度不符');
+    if ((await handle.read(header, 0, 12, 0)).bytesRead !== 12 || header.readUInt32LE(0) !== 0x46546c67 || header.readUInt32LE(4) !== 2) {
+      throw new HttpError(400, '文件不是有效的 GLB 2.0');
     }
+    const declaredSize = header.readUInt32LE(8);
+    if (declaredSize !== actualSize) throw new HttpError(400, `GLB 文件长度不符：文件头声明 ${declaredSize} 字节，实际 ${actualSize} 字节，文件可能已截断`);
     let offset = 12;
     let chunks = 0;
     let binLength: number | undefined;
@@ -56,10 +61,11 @@ export async function validateGlb(filename: string, size: number): Promise<void>
       if (++chunks > 1024 || offset + 8 > size || (await handle.read(chunkHeader, 0, 8, offset)).bytesRead !== 8) throw new HttpError(400, 'GLB 分块数量或长度无效');
       const length = chunkHeader.readUInt32LE(0);
       const type = chunkHeader.readUInt32LE(4);
-      if (length % 4 !== 0 || offset + 8 + length > size) throw new HttpError(400, 'GLB 分块越界或未对齐');
+      if (length % 4 !== 0) throw new HttpError(400, `GLB 分块 ${chunks} 长度 ${length} 字节未按 4 字节对齐`);
+      if (offset + 8 + length > size) throw new HttpError(400, `GLB 分块 ${chunks}（${type === 0x004e4942 ? 'BIN' : 'JSON/扩展'}）不完整：声明 ${length} 字节，实际剩余 ${size - offset - 8} 字节`);
       if (chunks === 1 && type !== 0x4e4f534a) throw new HttpError(400, 'GLB 第一分块必须为 JSON');
       if (type === 0x4e4f534a) {
-        if (json || length === 0 || length > 8 * 1024 * 1024) throw new HttpError(400, 'GLB 必须只有一个 JSON 分块，且不超过 8 MB');
+        if (json || length === 0 || length > 32 * 1024 * 1024) throw new HttpError(400, 'GLB 必须只有一个 JSON 分块，且不超过 32 MiB');
         const bytes = Buffer.alloc(length);
         if ((await handle.read(bytes, 0, length, offset + 8)).bytesRead !== length) throw new HttpError(400, 'GLB JSON 分块不完整');
         try {
@@ -93,14 +99,24 @@ export async function validateGlb(filename: string, size: number): Promise<void>
     const buffers = (json.buffers ?? []) as unknown[];
     for (let i = 0; i < buffers.length; i++) {
       const buffer = objectBody(buffers[i]);
-      if (!Number.isSafeInteger(buffer.byteLength) || (buffer.byteLength as number) < 1 || (buffer.byteLength as number) > 100 * 1024 * 1024) throw new HttpError(400, 'GLB 缓冲区长度无效');
-      if (buffer.uri === undefined && (i !== 0 || binLength === undefined || (buffer.byteLength as number) > binLength || binLength - (buffer.byteLength as number) > 3)) throw new HttpError(400, 'GLB 缓冲区与二进制分块不匹配');
+      // Khronos buffer.schema.json requires byteLength >= 1; empty scenes omit buffers instead.
+      if (!Number.isSafeInteger(buffer.byteLength) || (buffer.byteLength as number) < 1 || (buffer.byteLength as number) > MODEL_MAX_BYTES) throw new HttpError(400, `GLB buffers[${i}].byteLength 必须为 1–${MODEL_MAX_BYTES} 字节，实际为 ${String(buffer.byteLength)}`);
+      if (buffer.uri === undefined) {
+        if (i !== 0) throw new HttpError(400, `GLB buffers[${i}] 缺少 URI：仅 buffers[0] 可使用 BIN 分块`);
+        if (binLength === undefined) throw new HttpError(400, `GLB buffers[0] 声明 ${buffer.byteLength} 字节，但缺少 BIN 分块`);
+        if ((buffer.byteLength as number) > binLength) throw new HttpError(400, `GLB buffers[0] 声明 ${buffer.byteLength} 字节，BIN 实际只有 ${binLength} 字节，二进制数据已截断`);
+        // https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#glb-stored-buffer requires BIN >= byteLength, with no upper tail cap.
+        // GLTFLoader uses the BIN body and slices declared bufferViews; unused tail bytes stay unused.
+      }
     }
-    for (const item of (json.bufferViews ?? []) as unknown[]) {
-      const view = objectBody(item);
+    const bufferViews = (json.bufferViews ?? []) as unknown[];
+    for (let i = 0; i < bufferViews.length; i++) {
+      const view = objectBody(bufferViews[i]);
       const index = view.buffer;
       const start = view.byteOffset ?? 0;
-      if (!Number.isInteger(index) || (index as number) < 0 || (index as number) >= buffers.length || !Number.isSafeInteger(start) || (start as number) < 0 || !Number.isSafeInteger(view.byteLength) || (view.byteLength as number) < 1 || (start as number) + (view.byteLength as number) > (objectBody(buffers[index as number]).byteLength as number)) throw new HttpError(400, 'GLB bufferView 范围无效');
+      if (!Number.isInteger(index) || (index as number) < 0 || (index as number) >= buffers.length) throw new HttpError(400, `GLB bufferViews[${i}].buffer 索引无效：${String(index)}`);
+      const bufferLength = objectBody(buffers[index as number]).byteLength as number;
+      if (!Number.isSafeInteger(start) || (start as number) < 0 || !Number.isSafeInteger(view.byteLength) || (view.byteLength as number) < 1 || (start as number) > bufferLength || (view.byteLength as number) > bufferLength - (start as number)) throw new HttpError(400, `GLB bufferViews[${i}] 越界：偏移 ${String(start)}，长度 ${String(view.byteLength)}，buffers[${String(index)}] 声明 ${bufferLength} 字节`);
     }
     for (const item of (json.images ?? []) as unknown[]) {
       const image = objectBody(item);

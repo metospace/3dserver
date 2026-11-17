@@ -3,9 +3,10 @@ import { GLTFLoader, type GLTF } from 'three/addons/loaders/GLTFLoader.js'
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js'
 import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js'
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js'
+import { MODEL_MAX_BYTES, MODEL_MAX_MB, MODEL_TIMEOUT_MS } from '../limits'
 
-export const MAX_GLB_BYTES = 100 * 1024 * 1024
-const LOAD_TIMEOUT = 60_000
+export const MAX_GLB_BYTES = MODEL_MAX_BYTES
+const LOAD_TIMEOUT = MODEL_TIMEOUT_MS
 
 export function abortError(): DOMException {
   return new DOMException('加载已取消', 'AbortError')
@@ -19,14 +20,14 @@ export function errorMessage(error: unknown): string {
 /** Validate before GLTFLoader can initiate any model-dependent network request. */
 function validateGlb(data: ArrayBuffer): void {
   if (data.byteLength < 20 || data.byteLength > MAX_GLB_BYTES) {
-    throw new Error('GLB 文件为空、损坏或超过 100 MB 限制。')
+    throw new Error(`GLB 文件为空、损坏或超过 ${MODEL_MAX_MB} MB 限制。`)
   }
   const view = new DataView(data)
   if (view.getUint32(0, true) !== 0x46546c67 || view.getUint32(4, true) !== 2 || view.getUint32(8, true) !== data.byteLength) {
     throw new Error('只支持完整的 GLB 2.0 文件。')
   }
   const length = view.getUint32(12, true)
-  if (view.getUint32(16, true) !== 0x4e4f534a || length > data.byteLength - 20) {
+  if (view.getUint32(16, true) !== 0x4e4f534a || length > 32 * 1024 * 1024 || length > data.byteLength - 20) {
     throw new Error('GLB 文件的 JSON 数据无效。')
   }
   let json: unknown
@@ -116,27 +117,32 @@ export async function fetchGlb(url: string, signal: AbortSignal): Promise<ArrayB
   try {
     const response = await fetch(target, { signal: controller.signal, credentials: 'same-origin', redirect: 'error' })
     if (!response.ok) throw new Error(`模型加载失败（${response.status}），请检查登录状态或访问权限。`)
-    if (Number(response.headers.get('content-length')) > MAX_GLB_BYTES) throw new Error('GLB 文件超过 100 MB 限制。')
+    const declared = Number(response.headers.get('content-length'))
+    if (declared > MAX_GLB_BYTES) throw new Error(`GLB 文件超过 ${MODEL_MAX_MB} MB 限制。`)
     if (!response.body) throw new Error('模型文件内容为空。')
     const reader = response.body.getReader()
+    // Normal authenticated file responses have Content-Length. Fill one allocation rather than retain a second model-sized copy.
+    const bounded = Number.isSafeInteger(declared) && declared > 0 ? new Uint8Array(declared) : undefined
     const chunks: Uint8Array[] = []
     let size = 0
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
-      size += value.byteLength
-      if (size > MAX_GLB_BYTES) {
+      if (size + value.byteLength > MAX_GLB_BYTES || (bounded && size + value.byteLength > bounded.byteLength)) {
         await reader.cancel()
-        throw new Error('GLB 文件超过 100 MB 限制。')
+        throw new Error('模型传输长度超出声明或文件大小限制。')
       }
-      chunks.push(value)
+      if (bounded) bounded.set(value, size)
+      else chunks.push(value)
+      size += value.byteLength
+    }
+    if (bounded) {
+      if (size !== bounded.byteLength) throw new Error('模型文件传输不完整，请重新加载。')
+      return bounded.buffer
     }
     const result = new Uint8Array(size)
     let offset = 0
-    for (const chunk of chunks) {
-      result.set(chunk, offset)
-      offset += chunk.byteLength
-    }
+    for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.byteLength }
     return result.buffer
   } catch (error) {
     if (signal.aborted) throw abortError()

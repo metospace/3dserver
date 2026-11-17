@@ -4,6 +4,7 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import type { GLTF } from 'three/addons/loaders/GLTFLoader.js'
 import { createLights, disposeGltf, disposeObject, errorMessage, fetchGlb, frameObject, parseGlb } from '../three/loader'
+import { captureRenderedThumbnail, type ThumbnailCapture } from '../three/thumbnail'
 import { resolvedTheme } from '../theme'
 
 const props = defineProps<{ url: string; kind: 'asset' | 'scene' }>()
@@ -136,6 +137,20 @@ function seek(event: Event): void {
   mixer.update(0)
   time.value = action.time
 }
+
+async function captureThumbnail(): Promise<Blob> {
+  if (!mounted || !ready.value || !gltf || !renderer || !scene || !camera) {
+    throw new Error(problem.value || '模型尚未成功加载，无法生成缩略图。')
+  }
+  try {
+    // Do not advance animation, controls or reset the camera: capture exactly the current preview.
+    return await captureRenderedThumbnail(renderer, scene, camera)
+  } catch (error) {
+    throw new Error(`无法捕获当前预览缩略图：${errorMessage(error)}`)
+  }
+}
+
+defineExpose<ThumbnailCapture>({ captureThumbnail })
 
 async function loadModel(): Promise<void> {
   const request = ++generation

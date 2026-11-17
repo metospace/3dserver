@@ -11,6 +11,7 @@ import { HttpError, text, tags, objectBody, originalFilename, validateGlb, valid
 import { prepareDashboard, loadManifest, loadPackage, syncFile, PACKAGE_UPLOAD_LIMIT } from './dashboard.js';
 import type { Kind, Role, Category, Version, ModelRecord } from '../src/contracts.js';
 import { appVersion } from '../src/release.js';
+import { MODEL_MAX_BYTES, MODEL_MAX_MB, MODEL_TIMEOUT_MS } from '../src/limits.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dataDir = path.resolve(process.env.DATA_DIR || path.join(root, 'data'));
@@ -292,10 +293,28 @@ function countedStorage(limit: number): multer.StorageEngine {
     _removeFile(req, file, done) { storage._removeFile(req, file, done); },
   };
 }
-const libraryUpload = multer({ storage: countedStorage(PACKAGE_UPLOAD_LIMIT), limits: {
+const dashboardUpload = multer({ storage: countedStorage(PACKAGE_UPLOAD_LIMIT), limits: {
   fileSize: PACKAGE_UPLOAD_LIMIT, files: 2000, fields: 12, parts: 2012,
   fieldSize: 4 * 1024 * 1024, fieldNameSize: 100, headerPairs: 100,
 } }).fields([{ name: 'file', maxCount: 1 }, { name: 'files[]', maxCount: 2000 }]);
+// Busboy flags reaching fileSize as truncated; countedStorage enforces the inclusive byte limit.
+const modelUpload = multer({ storage: countedStorage(MODEL_MAX_BYTES), limits: {
+  fileSize: MODEL_MAX_BYTES + 1, files: 1, fields: 12, parts: 13,
+  fieldSize: 4 * 1024 * 1024, fieldNameSize: 100, headerPairs: 100,
+} }).fields([{ name: 'file', maxCount: 1 }]);
+// Requests without a kind query still work; the parsed kind is checked before hashing or preparation.
+const unspecifiedUpload = multer({ storage: countedStorage(MODEL_MAX_BYTES), limits: {
+  fileSize: MODEL_MAX_BYTES + 1, files: 2000, fields: 12, parts: 2012,
+  fieldSize: 4 * 1024 * 1024, fieldNameSize: 100, headerPairs: 100,
+} }).fields([{ name: 'file', maxCount: 1 }, { name: 'files[]', maxCount: 2000 }]);
+const libraryUpload: RequestHandler = (req, res, next) => {
+  try {
+    const kind = req.params.id ? recordAccess((req as AuthRequest).user!, req.params.id, true).kind
+      : req.query.kind === undefined ? undefined : kindValue(req.query.kind);
+    const parser = kind === undefined ? unspecifiedUpload : kind === 'dashboard' ? dashboardUpload : modelUpload;
+    parser(req, res, next);
+  } catch (error) { next(error); }
+};
 const thumbnailUpload = multer({ storage: countedStorage(2 * 1024 * 1024), limits: {
   fileSize: 2 * 1024 * 1024, files: 1, fields: 1, parts: 2, fieldSize: 100, headerPairs: 100,
 } }).single('file');
@@ -318,7 +337,7 @@ function upload(parser: RequestHandler): RequestHandler {
       cleanup();
     };
     res.once('finish', release); res.once('close', release); req.once('aborted', release);
-    req.setTimeout(120000, () => { req.destroy(); release(); });
+    req.setTimeout(MODEL_TIMEOUT_MS, () => { req.destroy(); release(); });
     parser(req, res, error => {
       if (error) { cleanup(); next(error); }
       else if (req.aborted) cleanup();
@@ -331,6 +350,14 @@ function uploadedFiles(req: AuthRequest): Express.Multer.File[] {
   const single = req.files.file ?? [], folder = req.files['files[]'] ?? [];
   if ((!single.length && !folder.length) || (single.length && folder.length)) throw new HttpError(400, '请选择单文件或文件夹，不能混用');
   return [...single, ...folder];
+}
+function checkUploadLimits(kind: Kind, files: Express.Multer.File[]) {
+  if (kind === 'dashboard') {
+    if (files.reduce((total, file) => total + file.size, 0) > PACKAGE_UPLOAD_LIMIT) throw new HttpError(413, '大屏上传总大小不得超过 100 MiB');
+  } else {
+    if (files.length !== 1 || files[0].fieldname !== 'file') throw new HttpError(400, '模型上传必须为单个 GLB 文件');
+    if (files[0].size > MODEL_MAX_BYTES) throw new HttpError(413, `GLB 文件不得超过 ${MODEL_MAX_MB} MiB`);
+  }
 }
 function idempotencyKey(body: Record<string, unknown>): string {
   const key = text(body.idempotencyKey, '幂等请求编号', 36, 36);
@@ -392,7 +419,9 @@ function insertVersion(prepared: PreparedUpload, recordId: string, number: numbe
 app.post('/api/records', gate(req => writeAccess(req.user!)), upload(libraryUpload), route(async (req, res) => {
   const body = objectBody(req.body), kind = kindValue(body.kind);
   writeAccess(req.user!, kind);
+  if (req.query.kind !== undefined && kindValue(req.query.kind) !== kind) throw new HttpError(400, '上传类型与请求 kind 不匹配');
   const key = idempotencyKey(body), files = uploadedFiles(req);
+  checkUploadLimits(kind, files);
   const input = { kind, name: text(body.name, '名称', 160, 1), description: text(body.description, '说明', 10000),
     tags: tags(body.tags, true), categoryId: body.categoryId === '' || body.categoryId === undefined ? null : body.categoryId,
     note: text(body.note, '版本说明', 2000), paths: body.paths ?? null, entry: body.entry ?? null };
@@ -441,6 +470,7 @@ app.patch('/api/records/:id', route((req, res) => {
 app.post('/api/records/:id/versions', gate(req => recordAccess(req.user!, req.params.id!, true)), upload(libraryUpload), route(async (req, res) => {
   const record = recordAccess(req.user!, req.params.id!, true);
   const body = objectBody(req.body), key = idempotencyKey(body), files = uploadedFiles(req);
+  checkUploadLimits(record.kind, files);
   const expected = revisionValue(body.expectedRevision, true), note = text(body.note, '版本说明', 2000);
   const digest = await fingerprint('create-version', record.id, { kind: record.kind, expectedRevision: expected, note, paths: body.paths ?? null, entry: body.entry ?? null }, files);
   const prior = replay(req.user!.id, key, digest);
@@ -482,6 +512,20 @@ app.patch('/api/records/:id/archive', route((req, res) => {
     const record = recordAccess(req.user!, req.params.id!); checkRevision(record, expected);
     db.prepare('UPDATE records SET archived=?,revision=revision+1,updated_at=? WHERE id=?').run(body.archived ? 1 : 0, new Date().toISOString(), record.id);
     return recordDto(recordAccess(req.user!, record.id));
+  }).immediate();
+  res.json(result);
+}));
+app.patch('/api/versions/:id/note', route((req, res) => {
+  const body = objectBody(req.body), expected = revisionValue(body.expectedRevision);
+  if (typeof body.note !== 'string') throw new HttpError(400, '版本说明必须是文本');
+  const note = text(body.note, '版本说明', 2000, 0, false);
+  const result = db.transaction(() => {
+    const { version, record } = versionAccess(req.user!, req.params.id!, true);
+    checkRevision(record, expected); requireActive(record);
+    db.prepare('UPDATE versions SET note=? WHERE id=?').run(note, version.id);
+    db.prepare('UPDATE records SET revision=revision+1,updated_at=? WHERE id=?').run(new Date().toISOString(), record.id);
+    const versions = db.prepare('SELECT * FROM versions WHERE record_id=? ORDER BY number DESC').all(record.id) as VersionRow[];
+    return { record: recordDto(recordAccess(req.user!, record.id)), versions: versions.map(versionDto) };
   }).immediate();
   res.json(result);
 }));
@@ -561,7 +605,7 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   if (res.headersSent) { res.destroy(error instanceof Error ? error : undefined); return; }
   if (error instanceof HttpError) { res.status(error.status).json({ error: error.message, code: error.code, currentRevision: error.currentRevision }); return; }
   if (error instanceof multer.MulterError) {
-    res.status(error.code === 'LIMIT_FILE_SIZE' ? 413 : 400).json({ error: error.code === 'LIMIT_FILE_SIZE' ? '文件超过大小限制（包或 GLB 100 MB，PNG 2 MB）' : '上传格式无效、字段过多或包含多余文件' }); return;
+    res.status(error.code === 'LIMIT_FILE_SIZE' ? 413 : 400).json({ error: error.code === 'LIMIT_FILE_SIZE' ? `文件超过大小限制（GLB ${MODEL_MAX_MB} MiB，大屏 100 MiB，PNG 2 MiB）` : '上传格式无效、字段过多或包含多余文件' }); return;
   }
   const detail = error as { type?: string; code?: string; status?: number };
   if (detail.type === 'entity.too.large') { res.status(413).json({ error: '请求内容过大' }); return; }
@@ -587,7 +631,7 @@ const server = app.listen(port, process.env.HOST || '127.0.0.1', () => {
   const address = server.address();
   if (address && typeof address !== 'string') console.log(`Scenivo 服务已启动：http://${process.env.HOST || '127.0.0.1'}:${address.port}`);
 });
-server.requestTimeout = 120000; server.headersTimeout = 15000;
+server.requestTimeout = MODEL_TIMEOUT_MS; server.headersTimeout = 15000;
 server.on('error', error => { console.error('服务启动失败', error); auth.close(); db.close(); process.exitCode = 1; });
 let stopping = false;
 function shutdown() {

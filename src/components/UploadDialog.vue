@@ -4,6 +4,7 @@ import { api, ApiError, bytes, json, splitTags, upload } from '../api'
 import type { Category, Detail, Kind, ModelRecord, Version } from '../contracts'
 import { generateThumbnail } from '../three/thumbnail'
 import { createUuid } from '../uuid'
+import { MODEL_MAX_BYTES, MODEL_MAX_MB } from '../limits'
 import AppIcon from './AppIcon.vue'
 const props = defineProps<{ kind: Kind; categories: Category[]; record?: ModelRecord; initialCategory: string }>()
 const kind = props.kind
@@ -73,8 +74,9 @@ function formData(item: UploadItem, value: Snapshot) {
 function validate(item: UploadItem) {
   if (!item.name.trim()) throw new Error('请填写条目名称')
   if (item.files.length > 2000) throw new Error('文件夹最多包含 2000 个文件')
-  if (item.files.reduce((sum, file) => sum + file.size, 0) > 100 * 1024 * 1024) throw new Error('单次源文件总计不能超过 100 MB')
-  if (item.files.some(file => file.size > 100 * 1024 * 1024)) throw new Error('单个文件不能超过 100 MB')
+  const limit = kind === 'dashboard' ? 100 * 1024 * 1024 : MODEL_MAX_BYTES
+  if (item.files.reduce((sum, file) => sum + file.size, 0) > limit) throw new Error(`单次源文件总计不能超过 ${kind === 'dashboard' ? 100 : MODEL_MAX_MB} MB`)
+  if (item.files.some(file => file.size > limit)) throw new Error(`单个文件不能超过 ${kind === 'dashboard' ? 100 : MODEL_MAX_MB} MB`)
   if (kind === 'dashboard' && !/\.html?$/i.test(item.entry.trim())) throw new Error('请指定相对路径的 HTML 入口文件')
   if (item.paths.length && !item.paths.includes(item.entry.trim())) throw new Error('入口必须为所选文件夹内的 HTML 文件')
 }
@@ -83,7 +85,7 @@ async function send(item: UploadItem) {
   if (!value) return
   item.state = 'uploading'; item.message = ''; item.progress = 0
   try {
-    const path = value.recordId ? `/records/${value.recordId}/versions` : '/records'
+    const path = value.recordId ? `/records/${value.recordId}/versions` : `/records?kind=${value.kind}`
     let version: Version
     if (value.recordId) version = await upload<Version>(path, formData(item, value), progress => { item.progress = progress })
     else version = (await upload<ModelRecord>(path, formData(item, value), progress => { item.progress = progress })).currentVersion
@@ -93,7 +95,7 @@ async function send(item: UploadItem) {
         const image = await generateThumbnail(item.files[0]!)
         const form = new FormData(); form.append('file', image, 'thumbnail.png'); form.append('idempotencyKey', createUuid())
         await api(`/versions/${version.id}/thumbnail`, { method: 'POST', body: form })
-      } catch { item.message = '文件已保存；缩略图生成失败，可在详情中重新生成' }
+      } catch (cause) { item.message = `文件已保存；缩略图失败：${cause instanceof Error ? cause.message : '未知错误'}。可在列表补建。` }
     }
     emit('changed')
   } catch (cause) {
@@ -132,7 +134,7 @@ function newSubmission() {
 <template>
   <div class="modal-overlay" @click.self="close"><section class="modal wide" role="dialog" aria-modal="true" aria-labelledby="upload-title">
     <header class="modal-header"><div><h2 id="upload-title">{{ record ? `为「${record.name}」上传新版本` : `上传${label}` }}</h2></div><button class="icon-button" :disabled="busy" aria-label="关闭上传" @click="close"><AppIcon name="close" /></button></header>
-    <p class="fine">{{ kind === 'dashboard' ? 'HTML / ZIP / 文件夹 · 总计 ≤100 MB · 最多 2000 个文件 · 展开 ≤200 MB' : 'GLB · 单文件 ≤100 MB' }}</p>
+    <p class="fine">{{ kind === 'dashboard' ? 'HTML / ZIP / 文件夹 · 总计 ≤100 MB · 最多 2000 个文件 · 展开 ≤200 MB' : `GLB · 单文件 ≤${MODEL_MAX_MB} MB` }}</p>
     <p v-if="error" class="error-box" role="alert">{{ error }}</p>
     <div v-if="frozen && !completed" class="conflict-box"><button class="text-link" :disabled="busy" @click="newSubmission">开始新的提交（解除冻结）</button></div>
     <div class="dropzone" @dragover.prevent @drop.prevent="accept($event.dataTransfer?.files || null)"><AppIcon name="upload" :size="28" /><strong>{{ kind === 'dashboard' ? '选择 HTML、ZIP 或大屏文件夹' : '拖入 GLB 文件，或选择文件' }}</strong><div><button class="secondary" :disabled="busy || frozen" @click="fileInput?.click()">选择文件</button><button v-if="kind === 'dashboard' || !record" class="text-link" :disabled="busy || frozen" @click="folderInput?.click()">选择文件夹</button></div><input ref="fileInput" class="sr-only" type="file" :accept="kind === 'dashboard' ? '.html,.htm,.zip' : '.glb'" :multiple="kind !== 'dashboard' && !record" :disabled="busy || frozen" @change="accept(($event.target as HTMLInputElement).files)"><input ref="folderInput" class="sr-only" type="file" webkitdirectory multiple :disabled="busy || frozen" @change="accept(($event.target as HTMLInputElement).files, true)"></div>

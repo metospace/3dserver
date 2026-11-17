@@ -90,8 +90,9 @@ test('team libraries, categories, immutable versions, conflicts and idempotent u
       await admin.request('/setup', 'POST', { username: 'other', displayName: '其他', password: '123456' }, 409)
       await admin.request('/categories', 'POST', { kind: 'asset', name: '跨域' }, 403, { Origin: 'https://untrusted.invalid' })
       await admin.request('/projects', 'GET', undefined, 404)
-      asset = await editor.upload('/records', original, { kind: 'asset', name: '设备', tags: '["工业"]' })
+      asset = await editor.upload('/records', original, { kind: 'asset', name: '设备', tags: '["工业"]', note: '初次导入 · 原始材质 ✅' })
       firstVersion = asset.currentVersion
+      assert.equal(firstVersion.note, '初次导入 · 原始材质 ✅')
       assert.equal((await viewer.request<ModelRecord[]>('/records?kind=asset'))[0]!.id, asset.id)
       await viewer.upload('/records', original, { kind: 'asset', name: '禁止' }, 403)
       await anonymous.binary(`/versions/${firstVersion.id}/file`, 401)
@@ -145,6 +146,18 @@ test('team libraries, categories, immutable versions, conflicts and idempotent u
       assert.equal(detail.versions.length, 2)
       assert.deepEqual(await viewer.binary(`/versions/${firstVersion.id}/file?download=1`), original)
       asset = detail.record
+    })
+    await t.test('Unicode version notes round-trip and can be explicitly corrected with conflict protection', async () => {
+      const current = await editor.request<Detail>(`/records/${asset.id}`)
+      const note = '高压线束工作台 · 初次导入，保留原始材质 ✅'
+      const changed = await editor.request<Detail>(`/versions/${firstVersion.id}/note`, 'PATCH', { note, expectedRevision: current.record.revision })
+      assert.equal(changed.versions.find(version => version.id === firstVersion.id)!.note, note)
+      await viewer.request(`/versions/${firstVersion.id}/note`, 'PATCH', { note: '禁止修改', expectedRevision: changed.record.revision }, 403)
+      await editor.request(`/versions/${firstVersion.id}/note`, 'PATCH', { note: '过期修改', expectedRevision: current.record.revision }, 409)
+      assert.deepEqual(await viewer.binary(`/versions/${firstVersion.id}/file`), original)
+      const read = await viewer.request<Detail>(`/records/${asset.id}`)
+      assert.equal(read.versions.find(version => version.id === firstVersion.id)!.note, note)
+      asset = changed.record
     })
     await t.test('concurrent identical retries create one item; keys bind content and metadata', async () => {
       uploadKey = randomUUID()

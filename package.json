@@ -1,6 +1,6 @@
 {
   "name": "model-library",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,7 +9,7 @@
     "server": "node scripts/build-dashboard.mjs && tsx server/index.ts",
     "build": "node scripts/copy-decoders.mjs && node scripts/build-dashboard.mjs && vue-tsc --noEmit && vite build && esbuild server/index.ts --bundle --platform=node --format=esm --packages=external --outdir=build-server",
     "start": "node build-server/index.js",
-    "test": "node --import tsx --test tests/platform.test.ts tests/uuid.test.ts"
+    "test": "node --import tsx --test tests/platform.test.ts tests/uuid.test.ts tests/model-validation.test.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.10.0",

@@ -1,5 +1,11 @@
-export const appVersion = '1.1.1'
+export const appVersion = '1.1.2'
 export const releases = [
+  { version: '1.1.2', date: '2026-11-17', title: '大模型、缩略图与说明修复', changes: [
+    'GLB 上限提高至 512 MB，模型传输与解码允许较长处理时间；看板限制保持不变。',
+    '修正 BIN 大于声明缓冲区时的误拦，仍拒绝截断和越界引用。',
+    '缺失缩略图支持显式串行补建；详情使用已加载画面截取，失败显示实际原因。',
+    '版本说明可单独修改，保留并发冲突保护与原始模型文件。',
+  ] },
   { version: '1.1.1', date: '2026-11-17', title: '内网 HTTP 上传兼容修复', changes: [
     '使用 getRandomValues 生成安全随机 UUID，修复普通 HTTP 内网地址下选择文件时报 randomUUID 不可用。',
     '同步修复上传幂等标识、冲突重新提交、截图上传与看板预览标识，不改变版本和重试规则。',

@@ -14,7 +14,8 @@ import BrandLogo from './components/BrandLogo.vue'
 import { preferences } from './preferences'
 import { api, ApiError, bytes, date, fileUrl, json, sourceUrl, splitTags, thumbnailUrl } from './api'
 import type { Category, DashboardManifest, Detail, Kind, ModelRecord, User, Version } from './contracts'
-import { generateThumbnail } from './three/thumbnail'
+import { type ThumbnailCapture } from './three/thumbnail'
+import ThumbnailBackfill from './components/ThumbnailBackfill.vue'
 import { createUuid } from './uuid'
 import './library.css'
 
@@ -45,7 +46,7 @@ const selectedVersionId = ref('')
 const dashboardPreviewId = ref('')
 const manifest = ref<DashboardManifest | null>(null)
 const manifestLoading = ref(false)
-const modal = ref<'' | 'upload' | 'version' | 'edit' | 'categories' | 'accounts'>('')
+const modal = ref<'' | 'upload' | 'version' | 'edit' | 'categories' | 'accounts' | 'thumbnails' | 'note'>('')
 const metaForm = ref({ name: '', description: '', tags: '', categoryId: '' })
 const metaRevision = ref(0)
 const conflict = ref('')
@@ -54,6 +55,13 @@ interface ThumbnailRequest { versionId: string; file: Blob; key: string }
 const thumbnailRequest = ref<ThumbnailRequest | null>(null)
 const thumbnailError = ref('')
 const screenshotInput = ref<HTMLInputElement>()
+const modelViewer = ref<ThumbnailCapture>()
+const modelReadyVersion = ref('')
+const capturing = ref(false)
+const captureError = ref('')
+const noteVersion = ref<Version | null>(null)
+const noteText = ref('')
+const noteRevision = ref(0)
 const activeModule = computed(() => modules.find(module => module.kind === kind.value)!)
 const canEdit = computed(() => kind.value === 'dashboard' ? user.value?.role === 'admin' : user.value?.role === 'admin' || user.value?.role === 'editor')
 const selectedVersion = computed(() => detail.value?.versions.find(version => version.id === selectedVersionId.value))
@@ -64,6 +72,7 @@ const filtered = computed(() => {
   return records.value.filter(record => (!needle || [record.name, record.description, ...record.tags].join(' ').toLocaleLowerCase().includes(needle)) && (!tag.value || record.tags.includes(tag.value)))
     .sort((a, b) => sort.value === 'name' ? a.name.localeCompare(b.name, 'zh-CN') : sort.value === 'size' ? b.currentVersion.size - a.currentVersion.size : b.updatedAt.localeCompare(a.updatedAt))
 })
+const missingThumbnails = computed(() => filtered.value.filter(record => record.kind !== 'dashboard' && !record.currentVersion.hasThumbnail))
 watch(() => preferences.value.defaultSort, value => { sort.value = value })
 let routeSequence = 0
 let recordsSequence = 0
@@ -109,7 +118,7 @@ async function loadRoute() {
   settingsOpen.value = false
   const nextKind: Kind = parts[0] === 'scene' ? 'scene' : parts[0] === 'dashboard' ? 'dashboard' : parts[0] === 'asset' ? 'asset' : preferences.value.defaultLibrary
   if (kind.value !== nextKind) { query.value = ''; tag.value = ''; categoryId.value = ''; categories.value = []; records.value = []; sort.value = preferences.value.defaultSort }
-  kind.value = nextKind; detail.value = null; dashboardPreviewId.value = ''; manifest.value = null; conflict.value = ''; thumbnailRequest.value = null; thumbnailError.value = ''; loading.value = true; error.value = ''
+  kind.value = nextKind; detail.value = null; dashboardPreviewId.value = ''; manifest.value = null; conflict.value = ''; thumbnailRequest.value = null; thumbnailError.value = ''; modelReadyVersion.value = ''; captureError.value = ''; loading.value = true; error.value = ''
   try {
     await refreshCategories()
     if (sequence !== routeSequence) return
@@ -199,19 +208,47 @@ async function screenshotSelected(event: Event) {
   if (!/\.png$/i.test(file.name) || file.size > 2 * 1024 * 1024) { error.value = '截图必须是 2 MB 以内的 PNG 文件'; return }
   thumbnailRequest.value = { versionId: selectedVersion.value.id, file, key: createUuid() }; await sendThumbnail()
 }
-async function regenerateThumbnail() {
+async function capturePreview(onlyMissing = false) {
   const version = selectedVersion.value
-  if (!version) return
+  const viewer = modelViewer.value
+  const recordId = detail.value?.record.id
+  if (!version || !viewer || !recordId || !canEdit.value || capturing.value || (onlyMissing && version.hasThumbnail)) return
+  if (modelReadyVersion.value !== version.id) { captureError.value = '模型尚未加载完成'; return }
+  capturing.value = true; captureError.value = ''
+  try {
+    const image = await viewer.captureThumbnail()
+    const form = new FormData(); form.append('file', image, 'thumbnail.png'); form.append('idempotencyKey', createUuid())
+    await api(`/versions/${version.id}/thumbnail`, { method: 'POST', body: form })
+    if (detail.value?.record.id === recordId) {
+      const saved = detail.value.versions.find(item => item.id === version.id)
+      if (saved) saved.hasThumbnail = true
+      if (detail.value.record.currentVersionId === version.id) detail.value.record.currentVersion.hasThumbnail = true
+      ++thumbnailStamp.value
+    }
+  } catch (cause) { captureError.value = cause instanceof Error ? cause.message : '缩略图保存失败' }
+  finally { capturing.value = false }
+}
+function previewLoaded(versionId: string) {
+  modelReadyVersion.value = versionId
+  if (selectedVersionId.value === versionId && !selectedVersion.value?.hasThumbnail) void capturePreview(true)
+}
+async function thumbnailsChanged() { ++thumbnailStamp.value; await refreshRecords() }
+function editVersionNote(version: Version) {
+  if (!detail.value) return
+  noteVersion.value = version; noteText.value = version.note; noteRevision.value = detail.value.record.revision; error.value = ''; conflict.value = ''; modal.value = 'note'
+}
+async function saveVersionNote() {
   await act(async () => {
-    const response = await fetch(fileUrl(version.id), { credentials: 'same-origin' })
-    if (!response.ok) throw new Error('无法读取模型文件')
-    const image = await generateThumbnail(new File([await response.blob()], version.originalName, { type: 'model/gltf-binary' }))
-    thumbnailRequest.value = { versionId: version.id, file: image, key: createUuid() }
+    if (!noteVersion.value) return
+    detail.value = await api<Detail>(`/versions/${noteVersion.value.id}/note`, { method: 'PATCH', body: json({ note: noteText.value, expectedRevision: noteRevision.value }) })
+    modal.value = ''; await refreshRecords(); notice.value = '版本说明已更新'
   })
-  if (thumbnailRequest.value) await sendThumbnail()
+}
+async function reloadNoteBaseline() {
+  await act(async () => { await refreshDetail(); if (detail.value) noteRevision.value = detail.value.record.revision; conflict.value = ''; error.value = '' })
 }
 function accountChanged(account: User) { if (user.value?.id === account.id) { user.value = account; if (account.role !== 'admin') modal.value = '' } }
-watch(selectedVersionId, () => { dashboardPreviewId.value = ''; manifest.value = null; thumbnailRequest.value = null; thumbnailError.value = '' })
+watch(selectedVersionId, () => { dashboardPreviewId.value = ''; manifest.value = null; thumbnailRequest.value = null; thumbnailError.value = ''; modelReadyVersion.value = ''; captureError.value = '' })
 onMounted(async () => {
   window.addEventListener('hashchange', loadRoute)
   try {
@@ -238,7 +275,7 @@ onUnmounted(() => { window.removeEventListener('hashchange', loadRoute) })
       <div v-if="conflict && modal !== 'edit'" class="conflict-box global-error"><p>{{ conflict }}</p><button class="text-link" :disabled="busy" @click="reloadLatest">重新读取最新版本</button></div>
       <SettingsPage v-if="settingsOpen" :user="user" @manage-accounts="modal = 'accounts'" />
       <div v-else-if="loading" class="loading-state"><span class="spinner" />正在读取资源库…</div>
-      <template v-else-if="!detail"><section class="page-heading"><div><h1>{{ activeModule.label }}</h1></div><div class="heading-actions"><button v-if="canEdit" class="primary" @click="modal = 'upload'"><AppIcon name="plus" :size="18" />{{ kind === 'dashboard' ? '上传大屏' : '上传模型' }}</button></div></section>
+      <template v-else-if="!detail"><section class="page-heading"><div><h1>{{ activeModule.label }}</h1></div><div class="heading-actions"><button v-if="canEdit && missingThumbnails.length" class="secondary" @click="modal = 'thumbnails'">补建缩略图（{{ missingThumbnails.length }}）</button><button v-if="canEdit" class="primary" @click="modal = 'upload'"><AppIcon name="plus" :size="18" />{{ kind === 'dashboard' ? '上传大屏' : '上传模型' }}</button></div></section>
         <section class="library-body">
           <LibraryCategories :kind="kind" :categories="categories" :selected="categoryId" :editable="canEdit" @select="selectCategory" @manage="modal = 'categories'" />
           <div class="library-summary"><div><h2>{{ categoryId === 'uncategorized' ? '未分类' : categories.find(category => category.id === categoryId)?.name || '全部内容' }}<span>{{ records.length }}</span></h2></div></div><div class="toolbar"><label class="search-field"><AppIcon name="search" :size="18" /><input v-model="query" aria-label="搜索资源" placeholder="搜索名称、描述或标签…"></label><select v-model="tag" aria-label="筛选标签"><option value="">全部标签</option><option v-for="value in tags" :key="value" :value="value">{{ value }}</option></select><select v-model="sort" aria-label="排序方式"><option value="updated">最近更新</option><option value="name">名称排序</option><option value="size">文件大小</option></select><label v-if="user.role === 'admin'" class="archive-toggle"><input v-model="includeArchived" type="checkbox" @change="selectArchiveFilter">包含归档</label></div>
@@ -246,8 +283,8 @@ onUnmounted(() => { window.removeEventListener('hashchange', loadRoute) })
           <div v-else class="model-grid"><button v-for="record in filtered" :key="record.id" class="model-card" @click="navigate(kind, record.id)"><div class="card-preview"><img v-if="record.currentVersion.hasThumbnail" :src="`${thumbnailUrl(record.currentVersion.id)}?v=${thumbnailStamp}`" :alt="record.name + '截图'" loading="lazy"><div v-else class="preview-placeholder"><AppIcon :name="activeModule.icon" :size="48" /><span>{{ kind === 'dashboard' ? '暂无截图' : '暂无缩略图' }}</span></div><span class="file-chip">{{ record.currentVersion.sourceKind.toUpperCase() }}</span><span class="version-chip">v{{ record.currentVersion.number }}</span><span class="preview-open">查看详情<AppIcon name="arrow" :size="15" /></span></div><div class="card-content"><h3>{{ record.name }}<span v-if="record.archived" class="archived-badge">已归档</span></h3><div class="card-tags"><span v-for="value in record.tags.slice(0, 3)" :key="value">{{ value }}</span><span v-if="!record.tags.length" class="no-tag">{{ activeModule.label }}</span></div><div class="card-meta"><span>{{ bytes(record.currentVersion.size) }}</span><span>{{ new Date(record.updatedAt).toLocaleDateString('zh-CN') }}</span></div></div></button></div><div v-if="filtered.length" class="list-footer">显示 {{ filtered.length }} 个条目</div>
         </section></template>
       <template v-else><section class="detail-heading"><div><button class="back-link" @click="navigate()"><AppIcon name="back" :size="16" />返回{{ activeModule.label }}</button><h1>{{ detail.record.name }}<span class="type-badge">{{ activeModule.label }}</span><span v-if="detail.record.archived" class="archived-badge">已归档</span></h1></div><div class="heading-actions"><button v-if="user.role === 'admin'" class="secondary" :disabled="busy || !!conflict" @click="archive">{{ detail.record.archived ? '取消归档' : '归档' }}</button><button v-if="canEdit" class="secondary" @click="openEdit"><AppIcon name="edit" :size="16" />编辑信息</button><button v-if="canEdit && !detail.record.archived" class="primary" @click="modal = 'version'"><AppIcon name="upload" :size="17" />上传新版本</button></div></section>
-        <div class="detail-layout"><section class="viewer-panel"><div class="viewer-topline"><span>{{ kind === 'dashboard' ? '大屏版本截图' : '实时 3D 预览' }}</span><div><label for="preview-version">预览版本</label><select id="preview-version" v-model="selectedVersionId"><option v-for="version in detail.versions" :key="version.id" :value="version.id">v{{ version.number }}{{ version.id === detail.record.currentVersionId ? ' · 当前' : '' }}</option></select></div></div><template v-if="selectedVersion"><ModelViewer v-if="detail.record.kind !== 'dashboard'" :url="fileUrl(selectedVersion.id)" :kind="detail.record.kind" /><div v-else class="dashboard-cover"><img v-if="selectedVersion.hasThumbnail" :src="`${thumbnailUrl(selectedVersion.id)}?v=${thumbnailStamp}`" :alt="`${detail.record.name} v${selectedVersion.number}截图`"><div v-else class="preview-placeholder"><AppIcon name="folder" :size="52" /><span>暂无截图</span></div><button class="primary" @click="dashboardPreviewId = selectedVersion.id">隔离运行预览</button></div><div class="viewer-caption"><a class="text-link" :href="sourceUrl(selectedVersion)"><AppIcon name="download" :size="15" />下载{{ kind === 'dashboard' ? '源文件' : '原文件' }} v{{ selectedVersion.number }}</a></div><div v-if="kind === 'dashboard'" class="dashboard-files"><button class="text-link" :disabled="manifestLoading" @click="loadManifest">{{ manifestLoading ? '正在读取…' : manifest ? '重新读取文件清单' : '查看文件清单' }}</button><template v-if="manifest"><p class="fine">入口：{{ manifest.entry }} · {{ manifest.files.length }} 个文件</p><ul><li v-for="file in manifest.files" :key="file.path"><span>{{ file.path }}</span><small>{{ bytes(file.size) }}</small></li></ul></template></div></template></section>
-          <aside class="detail-sidebar"><section class="info-section"><h3>条目信息</h3><p class="record-description">{{ detail.record.description || '暂无描述' }}</p><div class="detail-tags"><span v-for="value in detail.record.tags" :key="value" class="tag">{{ value }}</span><span v-if="!detail.record.tags.length" class="muted">未添加标签</span></div><dl><dt>分类</dt><dd>{{ categories.find(category => category.id === detail?.record.categoryId)?.name || '未分类' }}</dd><dt>修订号</dt><dd>{{ detail.record.revision }}</dd><template v-if="selectedVersion"><dt>文件名</dt><dd>{{ selectedVersion.originalName }}</dd><dt>文件大小</dt><dd>{{ bytes(selectedVersion.size) }}</dd><dt>源文件格式</dt><dd>{{ selectedVersion.sourceKind.toUpperCase() }}</dd><template v-if="selectedVersion.entry"><dt>入口</dt><dd>{{ selectedVersion.entry }}</dd></template><dt>上传者</dt><dd>{{ selectedVersion.uploadedBy }}</dd><dt>上传时间</dt><dd>{{ date(selectedVersion.createdAt) }}</dd></template></dl><template v-if="canEdit && selectedVersion"><button v-if="kind !== 'dashboard'" class="text-link" :disabled="busy || !!thumbnailRequest" @click="regenerateThumbnail">重新生成预览缩略图</button><button v-else class="text-link" :disabled="busy || !!thumbnailRequest" @click="screenshotInput?.click()">上传此版本截图（PNG ≤2 MB）</button><input ref="screenshotInput" class="sr-only" type="file" accept="image/png,.png" @change="screenshotSelected"><div v-if="thumbnailRequest && thumbnailError" class="conflict-box"><p>{{ thumbnailError }}。原图片和提交凭据已保留。</p><button class="text-link" :disabled="busy" @click="sendThumbnail">使用原请求重试截图</button><button class="text-link" :disabled="busy" @click="thumbnailRequest = null; thumbnailError = ''">放弃本次截图提交</button></div></template></section><section class="version-section"><h3><AppIcon name="clock" :size="17" />版本记录<span>{{ detail.versions.length }}</span></h3><article v-for="version in detail.versions" :key="version.id" class="version-item" :class="{ viewing: version.id === selectedVersionId }"><div class="version-item-top"><button class="version-title" @click="selectedVersionId = version.id">v{{ version.number }}<span v-if="version.id === detail.record.currentVersionId" class="current-badge">当前</span></button><a :href="sourceUrl(version)" class="icon-button" :aria-label="`下载版本 ${version.number} 源文件`" title="下载原文件"><AppIcon name="download" :size="16" /></a></div><p>{{ version.note || '无版本说明' }}</p><small>{{ version.uploadedBy }} · {{ date(version.createdAt) }}</small><button v-if="canEdit && !detail.record.archived && version.id !== detail.record.currentVersionId" class="text-link" :disabled="busy || !!conflict" @click="setCurrent(version)">设为当前版本</button></article></section></aside>
+        <div class="detail-layout"><section class="viewer-panel"><div class="viewer-topline"><span>{{ kind === 'dashboard' ? '大屏版本截图' : '实时 3D 预览' }}</span><div><label for="preview-version">预览版本</label><select id="preview-version" v-model="selectedVersionId"><option v-for="version in detail.versions" :key="version.id" :value="version.id">v{{ version.number }}{{ version.id === detail.record.currentVersionId ? ' · 当前' : '' }}</option></select></div></div><template v-if="selectedVersion"><ModelViewer v-if="detail.record.kind !== 'dashboard'" ref="modelViewer" :key="selectedVersion.id" :url="fileUrl(selectedVersion.id)" :kind="detail.record.kind" @loaded="previewLoaded(selectedVersion.id)" /><div v-else class="dashboard-cover"><img v-if="selectedVersion.hasThumbnail" :src="`${thumbnailUrl(selectedVersion.id)}?v=${thumbnailStamp}`" :alt="`${detail.record.name} v${selectedVersion.number}截图`"><div v-else class="preview-placeholder"><AppIcon name="folder" :size="52" /><span>暂无截图</span></div><button class="primary" @click="dashboardPreviewId = selectedVersion.id">隔离运行预览</button></div><div class="viewer-caption"><a class="text-link" :href="sourceUrl(selectedVersion)"><AppIcon name="download" :size="15" />下载{{ kind === 'dashboard' ? '源文件' : '原文件' }} v{{ selectedVersion.number }}</a></div><div v-if="kind === 'dashboard'" class="dashboard-files"><button class="text-link" :disabled="manifestLoading" @click="loadManifest">{{ manifestLoading ? '正在读取…' : manifest ? '重新读取文件清单' : '查看文件清单' }}</button><template v-if="manifest"><p class="fine">入口：{{ manifest.entry }} · {{ manifest.files.length }} 个文件</p><ul><li v-for="file in manifest.files" :key="file.path"><span>{{ file.path }}</span><small>{{ bytes(file.size) }}</small></li></ul></template></div></template></section>
+          <aside class="detail-sidebar"><section class="info-section"><h3>条目信息</h3><p class="record-description">{{ detail.record.description || '暂无描述' }}</p><div class="detail-tags"><span v-for="value in detail.record.tags" :key="value" class="tag">{{ value }}</span><span v-if="!detail.record.tags.length" class="muted">未添加标签</span></div><dl><dt>分类</dt><dd>{{ categories.find(category => category.id === detail?.record.categoryId)?.name || '未分类' }}</dd><dt>修订号</dt><dd>{{ detail.record.revision }}</dd><template v-if="selectedVersion"><dt>文件名</dt><dd>{{ selectedVersion.originalName }}</dd><dt>文件大小</dt><dd>{{ bytes(selectedVersion.size) }}</dd><dt>源文件格式</dt><dd>{{ selectedVersion.sourceKind.toUpperCase() }}</dd><template v-if="selectedVersion.entry"><dt>入口</dt><dd>{{ selectedVersion.entry }}</dd></template><dt>上传者</dt><dd>{{ selectedVersion.uploadedBy }}</dd><dt>上传时间</dt><dd>{{ date(selectedVersion.createdAt) }}</dd></template></dl><template v-if="canEdit && selectedVersion"><button v-if="kind !== 'dashboard'" class="text-link" :disabled="busy || capturing || modelReadyVersion !== selectedVersion.id" @click="capturePreview(false)">{{ capturing ? '正在保存缩略图…' : '保存当前视图为缩略图' }}</button><button v-else class="text-link" :disabled="busy || !!thumbnailRequest" @click="screenshotInput?.click()">上传此版本截图（PNG ≤2 MB）</button><p v-if="captureError" class="error-box" role="alert">{{ captureError }}</p><input ref="screenshotInput" class="sr-only" type="file" accept="image/png,.png" @change="screenshotSelected"><div v-if="thumbnailRequest && thumbnailError" class="conflict-box"><p>{{ thumbnailError }}。原图片和提交凭据已保留。</p><button class="text-link" :disabled="busy" @click="sendThumbnail">使用原请求重试截图</button><button class="text-link" :disabled="busy" @click="thumbnailRequest = null; thumbnailError = ''">放弃本次截图提交</button></div></template></section><section class="version-section"><h3><AppIcon name="clock" :size="17" />版本记录<span>{{ detail.versions.length }}</span></h3><article v-for="version in detail.versions" :key="version.id" class="version-item" :class="{ viewing: version.id === selectedVersionId }"><div class="version-item-top"><button class="version-title" @click="selectedVersionId = version.id">v{{ version.number }}<span v-if="version.id === detail.record.currentVersionId" class="current-badge">当前</span></button><a :href="sourceUrl(version)" class="icon-button" :aria-label="`下载版本 ${version.number} 源文件`" title="下载原文件"><AppIcon name="download" :size="16" /></a></div><p>{{ version.note || '无版本说明' }}</p><button v-if="canEdit && !detail.record.archived" class="text-link" :disabled="busy" @click="editVersionNote(version)">修改说明</button><small>{{ version.uploadedBy }} · {{ date(version.createdAt) }}</small><button v-if="canEdit && !detail.record.archived && version.id !== detail.record.currentVersionId" class="text-link" :disabled="busy || !!conflict" @click="setCurrent(version)">设为当前版本</button></article></section></aside>
         </div></template>
     </main>
     <div v-if="notice" class="toast" role="status"><AppIcon name="check" :size="18" />{{ notice }}<button class="icon-button" aria-label="关闭通知" @click="notice = ''"><AppIcon name="close" :size="16" /></button></div>
@@ -255,6 +292,8 @@ onUnmounted(() => { window.removeEventListener('hashchange', loadRoute) })
     <CategoryDialog v-if="modal === 'categories'" :kind="kind" :categories="categories" @close="modal = ''" @changed="act(refreshCategories)" />
     <AccountDialog v-if="modal === 'accounts' && user.role === 'admin'" @close="modal = ''" @changed="accountChanged" />
     <div v-if="modal === 'edit'" class="modal-overlay" @click.self="!busy && (modal = '')"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="edit-title"><header class="modal-header"><h2 id="edit-title">编辑条目信息</h2><button class="icon-button" :disabled="busy" aria-label="关闭" @click="modal = ''"><AppIcon name="close" /></button></header><p v-if="error" class="error-box" role="alert">{{ error }}</p><div v-if="conflict" class="conflict-box"><p>{{ conflict }}待编辑内容会保留。</p><button class="text-link" :disabled="busy" @click="reloadLatest">重新读取最新版本，保留待编辑内容</button></div><form class="stack-form" @submit.prevent="saveMeta"><label>名称<input v-model="metaForm.name" required maxlength="160" :disabled="busy"></label><label>描述<textarea v-model="metaForm.description" maxlength="4000" rows="3" :disabled="busy" /></label><label>标签<input v-model="metaForm.tags" maxlength="1000" placeholder="逗号分隔" :disabled="busy"></label><label>分类<select v-model="metaForm.categoryId" :disabled="busy"><option value="">未分类</option><option v-for="category in categories" :key="category.id" :value="category.id">{{ category.parentId ? `${categories.find(parent => parent.id === category.parentId)?.name} / ` : '' }}{{ category.name }}</option></select></label><footer class="modal-footer"><button type="button" class="secondary" :disabled="busy" @click="modal = ''">取消</button><button class="primary" :disabled="busy || !!conflict || !metaForm.name.trim()">保存修改</button></footer></form></section></div>
+    <ThumbnailBackfill v-if="modal === 'thumbnails'" :records="missingThumbnails" @close="modal = ''" @changed="thumbnailsChanged" />
+    <div v-if="modal === 'note' && noteVersion" class="modal-overlay"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="note-title"><header class="modal-header"><h2 id="note-title">修改 v{{ noteVersion.number }} 说明</h2><button class="icon-button" :disabled="busy" aria-label="关闭说明编辑" @click="modal = ''"><AppIcon name="close" /></button></header><p v-if="error" class="error-box" role="alert">{{ error }}</p><div v-if="conflict" class="conflict-box"><p>{{ conflict }}</p><button class="text-link" :disabled="busy" @click="reloadNoteBaseline">重新读取最新版本，保留输入</button></div><form class="stack-form" @submit.prevent="saveVersionNote"><label>版本说明<textarea v-model="noteText" rows="4" maxlength="2000" :disabled="busy" /></label><footer class="modal-footer"><button type="button" class="secondary" :disabled="busy" @click="modal = ''">取消</button><button class="primary" :disabled="busy || !!conflict">保存说明</button></footer></form></section></div>
     <DashboardViewer v-if="dashboardPreviewId && detail" :version-id="dashboardPreviewId" :title="detail.record.name" @close="dashboardPreviewId = ''" />
   </div>
 </template>
