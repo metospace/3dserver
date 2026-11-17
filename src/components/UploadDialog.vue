@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 import { api, ApiError, bytes, json, splitTags, upload } from '../api'
 import type { Category, Detail, Kind, ModelRecord, Version } from '../contracts'
 import { generateThumbnail } from '../three/thumbnail'
+import { createUuid } from '../uuid'
 import AppIcon from './AppIcon.vue'
 const props = defineProps<{ kind: Kind; categories: Category[]; record?: ModelRecord; initialCategory: string }>()
 const kind = props.kind
@@ -41,18 +42,18 @@ function accept(files: FileList | File[] | null, folder = false) {
     const paths = folder ? selected.map(file => file.webkitRelativePath.split('/').slice(1).join('/') || file.name) : []
     const htmlPaths = paths.filter(path => /\.html?$/i.test(path))
     const first = selected[0]!
-    queue.value = [{ id: crypto.randomUUID(), files: selected, paths, name: folder ? first.webkitRelativePath.split('/')[0]! : first.name.replace(/\.(html?|zip)$/i, ''), entry: folder ? htmlPaths.find(path => /(^|\/)index\.html?$/i.test(path)) || htmlPaths[0] || '' : /\.html?$/i.test(first.name) ? first.name : 'index.html', state: 'pending', progress: 0, message: '', snapshot: null }]
+    queue.value = [{ id: createUuid(), files: selected, paths, name: folder ? first.webkitRelativePath.split('/')[0]! : first.name.replace(/\.(html?|zip)$/i, ''), entry: folder ? htmlPaths.find(path => /(^|\/)index\.html?$/i.test(path)) || htmlPaths[0] || '' : /\.html?$/i.test(first.name) ? first.name : 'index.html', state: 'pending', progress: 0, message: '', snapshot: null }]
   } else {
     const accepted = selected.filter(file => /\.glb$/i.test(file.name))
     if (accepted.length !== selected.length) error.value = '已跳过非 GLB 文件。'
-    const items = accepted.map(file => ({ id: crypto.randomUUID(), files: [file], paths: [], name: file.name.replace(/\.glb$/i, ''), entry: '', state: 'pending' as const, progress: 0, message: '', snapshot: null }))
+    const items = accepted.map(file => ({ id: createUuid(), files: [file], paths: [], name: file.name.replace(/\.glb$/i, ''), entry: '', state: 'pending' as const, progress: 0, message: '', snapshot: null }))
     queue.value = record ? items.slice(0, 1) : [...queue.value, ...items]
   }
   if (fileInput.value) fileInput.value.value = ''
   if (folderInput.value) folderInput.value.value = ''
 }
 function snapshot(item: UploadItem, revision = openingRevision): Snapshot {
-  return { key: crypto.randomUUID(), kind, recordId: record?.id ?? null, name: item.name.trim(), description: description.value, tags: splitTags(tags.value), categoryId: categoryId.value, note: note.value, entry: item.entry.trim(), expectedRevision: revision }
+  return { key: createUuid(), kind, recordId: record?.id ?? null, name: item.name.trim(), description: description.value, tags: splitTags(tags.value), categoryId: categoryId.value, note: note.value, entry: item.entry.trim(), expectedRevision: revision }
 }
 function formData(item: UploadItem, value: Snapshot) {
   const form = new FormData()
@@ -90,7 +91,7 @@ async function send(item: UploadItem) {
     if (value.kind !== 'dashboard') {
       try {
         const image = await generateThumbnail(item.files[0]!)
-        const form = new FormData(); form.append('file', image, 'thumbnail.png'); form.append('idempotencyKey', crypto.randomUUID())
+        const form = new FormData(); form.append('file', image, 'thumbnail.png'); form.append('idempotencyKey', createUuid())
         await api(`/versions/${version.id}/thumbnail`, { method: 'POST', body: form })
       } catch { item.message = '文件已保存；缩略图生成失败，可在详情中重新生成' }
     }
@@ -117,7 +118,7 @@ async function rebase(item: UploadItem) {
   try {
     const latest = await api<Detail>(`/records/${item.snapshot.recordId}`)
     if (latest.record.archived) throw new Error('条目已归档，请先在详情中取消归档，再重新提交')
-    item.snapshot = { ...item.snapshot, expectedRevision: latest.record.revision, key: crypto.randomUUID() }
+    item.snapshot = { ...item.snapshot, expectedRevision: latest.record.revision, key: createUuid() }
     await send(item)
   } catch (cause) { error.value = cause instanceof Error ? cause.message : '读取最新版本失败' }
   finally { busy.value = false }

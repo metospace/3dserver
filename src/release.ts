@@ -1,5 +1,9 @@
-export const appVersion = '1.1.0'
+export const appVersion = '1.1.1'
 export const releases = [
+  { version: '1.1.1', date: '2026-11-17', title: '内网 HTTP 上传兼容修复', changes: [
+    '使用 getRandomValues 生成安全随机 UUID，修复普通 HTTP 内网地址下选择文件时报 randomUUID 不可用。',
+    '同步修复上传幂等标识、冲突重新提交、截图上传与看板预览标识，不改变版本和重试规则。',
+  ] },
   { version: '1.1.0', date: '2026-11-17', title: '团队资源库与设置', changes: [
     '固定资产、场景、看板三类库，移除项目并迁移保留已有文件与版本。',
     '分类移至主内容区筛选，选中一级分类后展开子分类；各库独立管理。',

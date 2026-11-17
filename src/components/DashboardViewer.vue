@@ -3,13 +3,14 @@ import { onBeforeUnmount, onMounted, ref } from 'vue'
 import type { DashboardPackage } from '../contracts'
 import { api } from '../api'
 import AppIcon from './AppIcon.vue'
+import { createUuid } from '../uuid'
 
 const props = defineProps<{ versionId: string; title: string }>()
 const emit = defineEmits<{ close: [] }>()
 const frame = ref<HTMLIFrameElement>()
 const loading = ref(true)
 const problem = ref('')
-const nonce = crypto.randomUUID()
+const nonce = createUuid()
 const abort = new AbortController()
 let pack: DashboardPackage | undefined
 let shellReady = false

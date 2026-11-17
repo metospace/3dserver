@@ -15,6 +15,7 @@ import { preferences } from './preferences'
 import { api, ApiError, bytes, date, fileUrl, json, sourceUrl, splitTags, thumbnailUrl } from './api'
 import type { Category, DashboardManifest, Detail, Kind, ModelRecord, User, Version } from './contracts'
 import { generateThumbnail } from './three/thumbnail'
+import { createUuid } from './uuid'
 import './library.css'
 
 const modules: { kind: Kind; label: string; icon: string }[] = [
@@ -196,7 +197,7 @@ async function screenshotSelected(event: Event) {
   const file = input.files?.[0]; input.value = ''
   if (!file || !selectedVersion.value) return
   if (!/\.png$/i.test(file.name) || file.size > 2 * 1024 * 1024) { error.value = '截图必须是 2 MB 以内的 PNG 文件'; return }
-  thumbnailRequest.value = { versionId: selectedVersion.value.id, file, key: crypto.randomUUID() }; await sendThumbnail()
+  thumbnailRequest.value = { versionId: selectedVersion.value.id, file, key: createUuid() }; await sendThumbnail()
 }
 async function regenerateThumbnail() {
   const version = selectedVersion.value
@@ -205,7 +206,7 @@ async function regenerateThumbnail() {
     const response = await fetch(fileUrl(version.id), { credentials: 'same-origin' })
     if (!response.ok) throw new Error('无法读取模型文件')
     const image = await generateThumbnail(new File([await response.blob()], version.originalName, { type: 'model/gltf-binary' }))
-    thumbnailRequest.value = { versionId: version.id, file: image, key: crypto.randomUUID() }
+    thumbnailRequest.value = { versionId: version.id, file: image, key: createUuid() }
   })
   if (thumbnailRequest.value) await sendThumbnail()
 }
