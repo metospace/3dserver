@@ -1,0 +1,9 @@
+node_modules/
+dist/
+build-server/
+data/
+.env
+*.log
+public/decoders/
+public/dashboard-sandbox.js
+backups/

@@ -1,0 +1,16 @@
+services:
+  model-library:
+    build: .
+    ports:
+      - "3187:3187"
+    volumes:
+      - model-data:/app/data
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3187
+      DATA_DIR: /app/data
+
+volumes:
+  model-data:

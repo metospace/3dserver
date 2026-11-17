@@ -1,0 +1,73 @@
+.module-navigation { display: grid; gap: 5px; margin-bottom: 20px; }
+.module-navigation button { display: flex; align-items: center; gap: 12px; width: 100%; padding: 12px 13px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--text-secondary); text-align: left; }
+.module-navigation button span { flex: 1; }
+.module-navigation button:hover { background: var(--hover); }
+.module-navigation button.active { color: var(--accent-text); border-color: var(--accent-soft-border); background: var(--accent-soft); }
+.settings-link.active { color: var(--accent-text); background: var(--accent-soft); }
+.category-filters { margin-bottom: 26px; padding-bottom: 22px; border-bottom: 1px solid var(--line); }
+.category-filter-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 13px; color: var(--muted); font-size: 12px; }
+.category-options { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.category-options button { padding: 7px 14px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--text-secondary); font-size: 12px; overflow-wrap: anywhere; max-width: 100%; }
+.category-options button:hover { background: var(--hover); }
+.category-options button.active { border-color: var(--accent-soft-border); background: var(--accent-soft); color: var(--accent-text); }
+.category-suboptions { margin-top: 13px; padding-top: 13px; border-top: 1px dashed var(--line); }
+.category-suboptions > span { margin-right: 5px; color: var(--muted); font-size: 11px; }
+.category-management { display: grid; gap: 7px; max-height: 250px; overflow: auto; margin-top: 18px; }
+.category-management article { display: flex; align-items: center; gap: 12px; padding: 10px; border: 1px solid var(--line); border-radius: 7px; }
+.category-management article.nested { margin-left: 15px; }
+.category-management article span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.account-list { max-height: 260px; overflow: auto; margin-top: 18px; }
+.account-row { display: flex; align-items: center; gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--line); }
+.account-row > div { flex: 1; min-width: 0; }
+.account-row strong, .account-row small { display: block; overflow-wrap: anywhere; }
+.account-row small { color: var(--muted); margin-top: 3px; }
+.account-row select { width: 120px; }
+.conflict-box { display: grid; gap: 10px; padding: 14px; margin: 14px 0; border: 1px solid var(--accent-border); border-radius: 8px; background: var(--accent-soft); color: var(--text-secondary); font-size: 12px; line-height: 1.7; }
+.conflict-box.global-error { margin: 18px 36px 0; }
+.conflict-box .text-link { justify-self: start; text-align: left; }
+.archive-toggle { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.archive-toggle input { width: auto; accent-color: var(--accent); }
+.archived-badge { display: inline-block; margin-left: 8px; padding: 3px 6px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--warning-text); background: var(--panel-inset); font-size: 10px; font-weight: 400; vertical-align: middle; }
+.dashboard-cover { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; min-height: 370px; padding: 24px; background: var(--viewer-bg); }
+.dashboard-cover > img { display: block; width: 100%; max-height: 550px; object-fit: contain; }
+.dashboard-cover .preview-placeholder { position: static; min-height: 180px; }
+.dashboard-cover .fine { text-align: center; }
+.dashboard-files { padding: 18px; border-top: 1px solid var(--line); }
+.dashboard-files .fine { margin-top: 12px; }
+.dashboard-files ul { list-style: none; padding: 0; margin: 12px 0 0; max-height: 350px; overflow: auto; }
+.dashboard-files li { display: flex; gap: 16px; justify-content: space-between; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
+.dashboard-files li span { overflow-wrap: anywhere; }
+.dashboard-files li small { color: var(--muted); white-space: nowrap; }
+.upload-name, .entry-field { display: grid; gap: 7px; font-size: 12px; }
+.entry-field { margin-top: 12px; }
+.entry-field input { width: 100%; }
+.upload-row-main .upload-name input { width: 100%; background: var(--input); border: 1px solid var(--line-strong); padding: 9px 10px; }
+.upload-row-main .entry-field input { padding: 9px 10px; }
+.upload-row-main > .text-link { margin-top: 8px; }
+.library-app .toolbar { flex-wrap: wrap; }
+.library-app .model-card { text-align: left; }
+.library-app .sidebar { overflow-y: auto; }
+.library-app .sidebar-bottom { flex-shrink: 0; }
+@media (max-width: 1100px) { .library-app .detail-layout { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 760px) {
+  .library-app .sidebar { display: flex; position: static; width: auto; height: auto; padding: 18px; }
+  .library-app .sidebar > .brand { display: flex; }
+  .library-app .sidebar > .workspace-label { display: none; }
+  .module-navigation { grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 15px 0 0; gap: 5px; }
+  .module-navigation button { justify-content: center; gap: 6px; padding: 10px 5px; font-size: 12px; }
+  .module-navigation button span { flex: 0 1 auto; white-space: nowrap; }
+  .module-navigation button > svg:last-child:not(:first-child) { display: none; }
+  .library-app { flex-direction: column; }
+  .library-app .sidebar-bottom { position: static; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .library-app .sidebar-bottom .sidebar-action { position: static; width: auto; padding: 5px 0; }
+  .library-app .sidebar-bottom .user-row { flex: 1; margin: 0; min-width: 180px; padding-top: 0; border: 0; }
+  .library-app .sidebar-bottom .user-row > div { display: block; }
+  .library-app .workspace { margin-left: 0; }
+  .library-app .workspace { width: 100%; }
+  .conflict-box.global-error { margin: 14px 18px 0; }
+  .dashboard-cover { min-height: 280px; padding: 16px; }
+  .library-app .viewer-caption { align-items: flex-start; flex-direction: column; gap: 10px; }
+  .category-management article { gap: 9px; }
+  .account-row { flex-wrap: wrap; }
+  .account-row select { width: 100px; }
+}
