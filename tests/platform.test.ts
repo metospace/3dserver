@@ -6,7 +6,9 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { createServer } from 'node:http'
+import { gzipSync } from 'node:zlib'
 import Database from 'better-sqlite3'
 import { zipSync, strToU8, unzipSync } from 'fflate'
 import type { Category, DashboardPackage, Detail, ModelRecord, User, Version } from '../src/contracts'
@@ -24,9 +26,9 @@ function glb(extra: Record<string, unknown> = {}): Buffer {
   output.writeUInt32LE(chunk.length, 12); output.writeUInt32LE(0x4e4f534a, 16); chunk.copy(output, 20)
   return output
 }
-async function start(data: string): Promise<RunningServer> {
+async function start(data: string, environment: NodeJS.ProcessEnv = {}): Promise<RunningServer> {
   const child = spawn(process.execPath, ['--import', 'tsx', 'server/index.ts'], {
-    env: { ...process.env, PORT: '0', HOST: '127.0.0.1', DATA_DIR: data }, stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, CHAT3D_TEAM_PASSWORD_LOGIN: '1', CHAT3D_PLATFORM_AUTH_BASE: '', ...environment, PORT: '0', HOST: '127.0.0.1', DATA_DIR: data }, stdio: ['ignore', 'pipe', 'pipe'],
   })
   let stderr = ''
   child.stderr!.on('data', chunk => { stderr += String(chunk) })
@@ -268,11 +270,197 @@ test('v1 migration preserves model identities, source bytes, history, sessions a
     await admin.request('/projects', 'GET', undefined, 404)
     await stop(running.child); running = undefined
     const database = new Database(join(directory, 'manager.sqlite'), { readonly: true })
-    assert.equal(database.pragma('user_version', { simple: true }), 2)
+    assert.equal(database.pragma('user_version', { simple: true }), 3)
     assert.deepEqual(database.pragma('foreign_key_check'), [])
     assert.equal(database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN('projects','project_members')").all().length, 0)
     database.close()
   } finally {
+    if (running) await stop(running.child)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+interface TeamItem { id: string; version: number; kind: string; owner: string; name: string; categoryPath: string[]; payload?: unknown }
+interface TeamSession { token: string; user: { id: string; name: string; role: string } }
+async function teamRequest<T>(base: string, path: string, options: { token?: string; body?: unknown; status?: number; headers?: Record<string, string>; binary?: boolean } = {}) {
+  const { token, body, status = 200, headers, binary } = options
+  const response = await fetch(`${base}/api/team/${path}`, {
+    method: body === undefined ? 'GET' : 'POST',
+    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...headers },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  if (binary) {
+    assert.equal(response.status, status, path)
+    return Buffer.from(await response.arrayBuffer()) as T
+  }
+  const value = await response.json()
+  assert.equal(response.status, status, `${path}: ${JSON.stringify(value)}`)
+  return value as T
+}
+
+test('Chat3D sessions, resumable publications and historical reads share the management library', { timeout: 60_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'chat3d-publications-'))
+  let running: RunningServer | undefined
+  const clientOrigin = 'https://client.example.test'
+  try {
+    running = await start(directory, { CHAT3D_TEAM_ORIGINS: clientOrigin })
+    let { base } = running
+    const manager = new Client(base)
+    await manager.request('/setup', 'POST', { username: 'admin', password: 'example-admin', displayName: '管理员' }, 201)
+    const publisher = await manager.request<User>('/users', 'POST', { username: 'editor', password: 'example-editor', displayName: '编辑者', role: 'editor' }, 201)
+    await manager.request('/users', 'POST', { username: 'viewer', password: 'example-viewer', displayName: '查看者', role: 'viewer' }, 201)
+    const preflight = await fetch(`${base}/api/team/items`, { method: 'OPTIONS', headers: { Origin: clientOrigin, 'Access-Control-Request-Headers': 'authorization', 'Access-Control-Request-Method': 'GET' } })
+    assert.equal(preflight.status, 204)
+    assert.equal(preflight.headers.get('access-control-allow-origin'), clientOrigin)
+    assert.equal(preflight.headers.get('access-control-allow-credentials'), null)
+    await teamRequest(base, 'items?kind=scene', { headers: { Origin: 'https://untrusted.example.test' }, status: 403 })
+    await teamRequest(base, 'me', { headers: { Cookie: manager.cookie }, status: 401 })
+    const login = (name: string) => teamRequest<TeamSession>(base, 'login', { body: { name, password: `example-${name}` } })
+    const { token, user } = await login('editor'), viewer = (await login('viewer')).token
+    assert.equal(user.id, publisher.id)
+    assert.equal(user.role, 'member')
+    const desktop = await fetch(`${base}/api/team/me`, { headers: { Origin: 'tauri://localhost', Authorization: `Bearer ${token}` } })
+    assert.equal(desktop.status, 200)
+    assert.equal(desktop.headers.get('access-control-allow-origin'), 'tauri://localhost')
+    assert.equal((await desktop.json()).id, publisher.id)
+    await new Client(base).request('/me', 'GET', undefined, 401, { Authorization: `Bearer ${token}` })
+    const key = randomUUID(), payload = { format: 'chat3d-project', version: 1, scene: {
+      schemaVersion: 1, projectId: 'assembly', revision: 1, unit: 'm', upAxis: 'Y', nodes: [], materials: [], assets: [],
+      viewState: { displayUnit: 'm' },
+    } }
+    const body = { payload, name: '团队场景一', description: '', kind: 'scene', key, expectedVersion: 0, categoryPath: ['车间', '装配线'] }
+    // Keep the published project small, but exercise a real multi-chunk wire package.
+    const bytes = gzipSync(JSON.stringify({ ...body, transportFixture: randomBytes(1100000).toString('base64') }))
+    const chunkBytes = 1024 * 1024, overall = createHash('sha256'), chunks: Buffer[] = []
+    for (let cursor = 0; cursor < bytes.length; cursor += chunkBytes) {
+      const chunk = bytes.subarray(cursor, cursor + chunkBytes); chunks.push(chunk)
+      overall.update(createHash('sha256').update(chunk).digest('hex'))
+    }
+    assert.equal(chunks.length, 2)
+    const startBody = { key, total: bytes.length, digest: overall.digest('hex'), encoding: 'gzip' }
+    await teamRequest(base, 'publish-uploads/start', { token: viewer, body: startBody, status: 403 })
+    const startUpload = () => teamRequest<{ uploadId: string; offset: number; result?: TeamItem }>(base, 'publish-uploads/start', { token, body: startBody })
+    const upload = await startUpload()
+    const chunk = (index: number) => ({ offset: index * chunkBytes, data: chunks[index]!.toString('base64') })
+    const chunkRoute = `publish-uploads/${upload.uploadId}/chunk`
+    await teamRequest(base, chunkRoute, { token, body: chunk(1), status: 409 })
+    await teamRequest(base, chunkRoute, { token, body: chunk(0) })
+    await teamRequest(base, chunkRoute, { token, body: chunk(0) })
+    await stop(running.child); running = undefined
+    running = await start(directory, { CHAT3D_TEAM_ORIGINS: clientOrigin }); base = running.base; manager.base = base
+    assert.equal((await startUpload()).offset, chunkBytes)
+    await teamRequest(base, chunkRoute, { token, body: chunk(1) })
+    const first = await teamRequest<TeamItem>(base, `publish-uploads/${upload.uploadId}/complete`, { token, body: {} })
+    assert.deepEqual((await startUpload()).result, first)
+    await teamRequest(base, 'publish', { token, body: { ...body, payload: {}, key: randomUUID() }, status: 400 })
+    const replacement = { ...body, key: randomUUID(), itemId: first.id, name: '团队场景二', expectedVersion: 1 }
+    const second = await teamRequest<TeamItem>(base, 'publish', { token, body: replacement })
+    assert.equal(second.version, 2)
+    assert.deepEqual(await teamRequest(base, 'publish', { token, body: replacement }), second)
+    await teamRequest(base, 'publish', { token, body: { ...replacement, key: randomUUID() }, status: 409 })
+    const rows = await teamRequest<TeamItem[]>(base, 'items?kind=scene', { token: viewer })
+    assert.deepEqual(rows.map(row => [row.id, row.version, row.name]), [[second.id, 2, replacement.name]])
+    const fixed = await teamRequest<TeamItem>(base, `items/${first.id}/1`, { token: viewer })
+    assert.deepEqual(fixed.categoryPath, ['车间', '装配线'])
+    assert.deepEqual(fixed.payload, payload)
+    const detail = await manager.request<Detail>(`/records/${first.id}`)
+    assert.equal(detail.record.currentVersion.sourceKind, 'chat3d')
+    assert.deepEqual(JSON.parse((await manager.binary(`/versions/${detail.versions[1]!.id}/source`)).toString()), payload)
+    await manager.request(`/records/${first.id}/current`, 'POST', { expectedRevision: detail.record.revision, versionId: detail.versions[1]!.id }, 204)
+    assert.equal((await teamRequest<TeamItem[]>(base, 'items?kind=scene', { token: viewer }))[0]!.version, 2)
+    const third = await teamRequest<TeamItem>(base, 'publish', { token, body: { ...replacement, key: randomUUID(), expectedVersion: 2 } })
+    assert.equal(third.version, 3)
+    await manager.request(`/users/${publisher.id}`, 'PATCH', { role: 'viewer' })
+    await teamRequest(base, 'me', { token, status: 401 })
+    await teamRequest(base, 'logout', { token: viewer, body: {} })
+    await teamRequest(base, 'items?kind=scene', { token: viewer, status: 401 })
+  } finally {
+    if (running) await stop(running.child)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('Chat3D and management clients resolve the same dashboard versions, source, and confirmed screenshot', { timeout: 60_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'chat3d-dashboards-'))
+  let running: RunningServer | undefined
+  try {
+    running = await start(directory)
+    const { base } = running, manager = new Client(base)
+    await manager.request('/setup', 'POST', { username: 'admin', password: 'example-admin', displayName: '管理员' }, 201)
+    const { token } = await teamRequest<TeamSession>(base, 'login', { body: { name: 'admin', password: 'example-admin' } })
+    const html = Buffer.from('<!doctype html><h1>看板模板</h1>')
+    const native = await manager.upload('/records?kind=dashboard', html, { kind: 'dashboard', name: '车间监控' }, 201, 'index.html')
+    const items = await teamRequest<TeamItem[]>(base, 'dashboards', { token })
+    assert.deepEqual(items.map(item => item.id), [native.id])
+    const key = randomUUID(), body = { key, itemId: native.id, name: '车间监控二', description: '', system: 'MES', entry: 'index.html', expectedVersion: 1, sourceKind: 'file', fileName: 'index.html' }
+    const { uploadId } = await teamRequest<{ uploadId: string }>(base, 'dashboards/uploads', { token, body })
+    const root = `dashboards/uploads/${uploadId}`
+    const { fileId } = await teamRequest<{ fileId: string }>(base, `${root}/files`, { token, body: { path: 'index.html', size: html.length } })
+    await teamRequest(base, `${root}/files/${fileId}/chunks`, { token, body: { offset: 0, base64: html.toString('base64') } })
+    assert.deepEqual(await teamRequest(base, `${root}/complete`, { token, body: {} }), { id: native.id, version: 2 })
+    assert.deepEqual(await teamRequest(base, `${root}/complete`, { token, body: {} }), { id: native.id, version: 2 })
+    const source = await manager.request<Detail>(`/records/${native.id}`)
+    assert.equal(source.record.currentVersion.number, 2)
+    assert.deepEqual(await manager.binary(`/versions/${source.record.currentVersionId}/source`), html)
+    const path = `dashboards/${native.id}/2`
+    const manifest = await teamRequest<{ files: { path: string; bytes: number }[] }>(base, path, { token })
+    assert.deepEqual(manifest.files, [{ path: 'index.html', bytes: html.length }])
+    assert.deepEqual(await teamRequest<Buffer>(base, `${path}/files?path=index.html`, { token, binary: true }), html)
+    const png = screenshotPng(320, 180)
+    const identity = await teamRequest<{ packageHash: string }>(base, `${path}/screenshot/info`, { token })
+    const screenshot = await teamRequest<{ id: string; width: number; height: number; sha256: string }>(base, `${path}/screenshot`, { token, body: {
+      packageHash: identity.packageHash, expectedScreenshotId: null, source: '浏览器实际渲染', capturedAt: new Date().toISOString(), confirmed: true, base64: png.toString('base64'),
+    } })
+    assert.deepEqual([screenshot.width, screenshot.height], [320, 180])
+    const stored = await teamRequest<Buffer>(base, `${path}/screenshot/${screenshot.id}`, { token, binary: true })
+    assert.equal(createHash('sha256').update(stored).digest('hex'), screenshot.sha256)
+    assert.deepEqual(await manager.binary(`/versions/${source.record.currentVersionId}/thumbnail`), stored)
+    await teamRequest(base, `dashboards/${native.id}/archive`, { token, body: { archived: true } })
+    assert.deepEqual(await teamRequest(base, 'dashboards', { token }), [])
+    assert.deepEqual(await teamRequest<Buffer>(base, `${path}/source`, { token, binary: true }), html)
+  } finally {
+    if (running) await stop(running.child)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('Chat3D OAuth callback exchanges an exact redirect, claims once, and isolates platform identity', { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'chat3d-auth-'))
+  let running: RunningServer | undefined, revoked = false, tokenRequests = 0
+  const platform = createServer(async (req, res) => {
+    res.setHeader('Content-Type', 'application/json')
+    if (req.url === '/admin-api/system/oauth2/token') {
+      tokenRequests++
+      for await (const _ of req) { /* consume authorization form */ }
+      res.end(JSON.stringify({ code: 0, data: { access_token: 'test-provider-access', refresh_token: 'test-provider-refresh', expires_in: 1200 } }))
+    } else if (req.url === '/admin-api/system/auth/get-permission-info' && req.headers.authorization === 'Bearer test-provider-access' && req.headers['tenant-id'] === '1') {
+      res.end(JSON.stringify(revoked ? { code: 401 } : { code: 0, data: { user: { id: 42, username: 'admin' } } }))
+    } else { res.writeHead(404).end('{}') }
+  })
+  try {
+    platform.listen(0, '127.0.0.1'); await once(platform, 'listening')
+    const address = platform.address() as { port: number }
+    running = await start(directory, { CHAT3D_PLATFORM_AUTH_BASE: `http://127.0.0.1:${address.port}`, CHAT3D_PLATFORM_OAUTH_CLIENT_SECRET: 'test-only-secret' })
+    const { base } = running, manager = new Client(base)
+    const { user: admin } = await manager.request<{ user: User }>('/setup', 'POST', { username: 'admin', displayName: '本地管理员', password: 'example-admin' }, 201)
+    const state = randomUUID(), body = { code: 'test-provider-code', state, tenantId: '1', redirectUri: `${base}/team/sso/callback` }
+    const callback = await fetch(body.redirectUri + '?code=test-provider-code&state=' + state)
+    assert.equal(callback.status, 200)
+    assert.ok(callback.headers.get('content-security-policy'))
+    assert.doesNotMatch(await callback.text(), /test-provider-code/)
+    await teamRequest(base, 'login/sso/code', { body: { ...body, redirectUri: 'https://unknown.example.test/team/sso/callback' }, status: 400 })
+    assert.equal(tokenRequests, 0)
+    const result = await teamRequest<TeamSession>(base, 'login/sso/code', { body })
+    assert.notEqual(result.user.id, admin.id)
+    assert.equal(result.user.role, 'member')
+    const claim = await teamRequest<{ platform: { accessToken: string } }>(base, 'login/sso/claim', { body: { state } })
+    assert.equal(claim.platform.accessToken, 'test-provider-access')
+    await teamRequest(base, 'login/sso/claim', { body: { state }, status: 404 })
+    revoked = true
+    await teamRequest(base, 'publish-uploads/start', { token: result.token, body: { key: randomUUID(), encoding: 'gzip', digest: '0'.repeat(64), total: 10 }, status: 401 })
+    await teamRequest(base, 'me', { token: result.token, status: 401 })
+  } finally {
+    platform.closeAllConnections(); platform.close()
     if (running) await stop(running.child)
     await rm(directory, { recursive: true, force: true })
   }

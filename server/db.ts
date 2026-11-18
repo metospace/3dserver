@@ -32,7 +32,7 @@ const versions = (name: string) => `CREATE TABLE ${name} (
   size INTEGER NOT NULL CHECK(size >= 0), note TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL, uploaded_by TEXT NOT NULL REFERENCES users(id),
   has_thumbnail INTEGER NOT NULL DEFAULT 0 CHECK(has_thumbnail IN (0,1)), thumbnail_path TEXT,
-  source_kind TEXT NOT NULL CHECK(source_kind IN ('glb','html','zip','folder')),
+  source_kind TEXT NOT NULL CHECK(source_kind IN ('glb','chat3d','html','zip','folder')),
   entry TEXT, UNIQUE(record_id,number)
 );`;
 const categories = `CREATE TABLE categories (
@@ -41,7 +41,13 @@ const categories = `CREATE TABLE categories (
 );
 CREATE UNIQUE INDEX category_root_name ON categories(kind,name) WHERE parent_id IS NULL;
 CREATE UNIQUE INDEX category_child_name ON categories(parent_id,name) WHERE parent_id IS NOT NULL;`;
-const supporting = `
+const currentVersionTrigger = `
+CREATE TRIGGER current_version_record BEFORE UPDATE OF current_version_id ON records
+WHEN NEW.current_version_id IS NOT NULL AND NOT EXISTS (
+  SELECT 1 FROM versions WHERE id=NEW.current_version_id AND record_id=NEW.id
+) BEGIN SELECT RAISE(ABORT,'version does not belong to record'); END;
+`;
+const supporting = currentVersionTrigger + `
 CREATE INDEX record_kind ON records(kind,archived,updated_at);
 CREATE INDEX record_category ON records(category_id);
 CREATE TABLE upload_receipts (
@@ -49,10 +55,6 @@ CREATE TABLE upload_receipts (
   fingerprint TEXT NOT NULL, response TEXT NOT NULL, created_at TEXT NOT NULL,
   PRIMARY KEY(user_id,key)
 );
-CREATE TRIGGER current_version_record BEFORE UPDATE OF current_version_id ON records
-WHEN NEW.current_version_id IS NOT NULL AND NOT EXISTS (
-  SELECT 1 FROM versions WHERE id=NEW.current_version_id AND record_id=NEW.id
-) BEGIN SELECT RAISE(ABORT,'version does not belong to record'); END;
 CREATE TRIGGER category_depth_insert BEFORE INSERT ON categories
 WHEN NEW.parent_id IS NOT NULL AND NOT EXISTS (
   SELECT 1 FROM categories WHERE id=NEW.parent_id AND parent_id IS NULL AND kind=NEW.kind
@@ -68,7 +70,7 @@ export function openDatabase(dataDir: string): Database.Database {
     db.pragma('busy_timeout = 5000');
     db.pragma('synchronous = FULL');
     const version = db.pragma('user_version', { simple: true }) as number;
-    if (version > 2) throw new Error('数据库版本高于当前服务支持的版本，请升级服务');
+    if (version > 3) throw new Error('数据库版本高于当前服务支持的版本，请升级服务');
     if (version === 0) {
       db.transaction(() => {
         db.exec(users('users') + categories + records('records') + versions('versions'));
@@ -76,7 +78,7 @@ export function openDatabase(dataDir: string): Database.Database {
           token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           expires_at INTEGER NOT NULL
         ); CREATE INDEX sessions_expiry ON sessions(expires_at);` + supporting);
-        db.pragma('user_version = 2');
+        db.pragma('user_version = 3');
       }).immediate();
     } else if (version === 1) {
       // Keep sessions and immutable files untouched. Foreign keys must be disabled outside the transaction.
@@ -102,7 +104,24 @@ export function openDatabase(dataDir: string): Database.Database {
           ` + supporting);
           const violations = db.pragma('foreign_key_check') as ForeignKeyViolation[];
           if (violations.length) throw new Error('数据库迁移外键检查失败，原数据库保持不变');
-          db.pragma('user_version = 2');
+          db.pragma('user_version = 3');
+        }).immediate();
+      } finally { db.pragma('foreign_keys = ON'); }
+    }
+    if (version === 2) {
+      db.pragma('foreign_keys = OFF');
+      try {
+        db.transaction(() => {
+          db.exec(versions('versions_v3') + `
+            INSERT INTO versions_v3 SELECT id,record_id,number,original_name,size,note,created_at,uploaded_by,
+              has_thumbnail,thumbnail_path,source_kind,entry FROM versions;
+            DROP TRIGGER current_version_record;
+            DROP TABLE versions;
+            ALTER TABLE versions_v3 RENAME TO versions;
+          ` + currentVersionTrigger);
+          const violations = db.pragma('foreign_key_check') as ForeignKeyViolation[];
+          if (violations.length) throw new Error('可编辑版本迁移外键检查失败');
+          db.pragma('user_version = 3');
         }).immediate();
       } finally { db.pragma('foreign_keys = ON'); }
     }

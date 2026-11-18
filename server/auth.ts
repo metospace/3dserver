@@ -7,6 +7,7 @@ import { HttpError, text, objectBody } from './validation.js';
 const SESSION_AGE = 7 * 24 * 60 * 60 * 1000;
 const COOKIE = 'glb_session';
 const hashToken = (value: string) => createHash('sha256').update(value).digest('hex');
+const DUMMY_PASSWORD_HASH = `scrypt$${'00'.repeat(16)}$${'00'.repeat(64)}`;
 
 function derive(password: string, salt: Buffer): Promise<Buffer> {
   // Node 20 lacks Promise.withResolvers; scrypt exposes its options through the callback overload.
@@ -22,16 +23,21 @@ async function passwordHash(password: string): Promise<string> {
 }
 
 async function passwordMatches(password: string, encoded?: string): Promise<boolean> {
-  const [, salt, hash] = (encoded ?? `scrypt$${'00'.repeat(16)}$${'00'.repeat(64)}`).split('$');
+  const stored = encoded?.startsWith('scrypt$') ? encoded : undefined;
+  const [, salt, hash] = (stored ?? DUMMY_PASSWORD_HASH).split('$');
   const actual = await derive(password, Buffer.from(salt, 'hex'));
   const expected = Buffer.from(hash, 'hex');
-  return actual.length === expected.length && timingSafeEqual(actual, expected) && encoded !== undefined;
+  return actual.length === expected.length && timingSafeEqual(actual, expected) && stored !== undefined;
 }
 
 export interface AuthRequest extends Request { user?: UserRow }
+export interface PasswordVerifier {
+  verifyPassword(req: Request, name: unknown, secret: unknown): Promise<UserRow>;
+}
 
 export function createAuth(db: Database.Database) {
   const attempts = new Map<string, { count: number; until: number }>();
+  const findUser = db.prepare('SELECT * FROM users WHERE username = ?');
   let activeHashes = 0;
   const prune = () => {
     const now = Date.now();
@@ -119,19 +125,26 @@ export function createAuth(db: Database.Database) {
     return { username, password, displayName };
   }
 
+  async function verifyPassword(req: Request, name: unknown, secret: unknown): Promise<UserRow> {
+    const username = text(name, '用户名', 40, 1);
+    const password = text(secret, '密码', 1024, 1, false);
+    throttle(req, username);
+    const user = findUser.get(username) as UserRow | undefined;
+    const matches = await withHash(() => passwordMatches(password, user?.password_hash));
+    if (!user || !matches) throw new HttpError(401, '用户名或密码错误');
+    const current = findUser.get(username) as UserRow | undefined;
+    if (!current || current.id !== user.id || current.password_hash !== user.password_hash) throw new HttpError(401, '用户名或密码错误');
+    attempts.delete(`name:${username.toLowerCase()}`);
+    return current;
+  }
+
   return {
     authenticate, requireUser, requireAdmin, credentials,
     async hash(password: string) { return withHash(() => passwordHash(password)); },
-    issueSession,
+    issueSession, verifyPassword,
     async login(req: Request, res: Response) {
       const body = objectBody(req.body);
-      const username = text(body.username, '用户名', 40, 1);
-      const password = text(body.password, '密码', 1024, 1, false);
-      throttle(req, username);
-      const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username) as UserRow | undefined;
-      if (!(await withHash(() => passwordMatches(password, user?.password_hash)))) throw new HttpError(401, '用户名或密码错误');
-      attempts.delete(`name:${username.toLowerCase()}`);
-      return issueSession(req, res, user!);
+      return issueSession(req, res, await verifyPassword(req, body.username, body.password));
     },
     logout(req: Request, res: Response) {
       const token = sessionToken(req);

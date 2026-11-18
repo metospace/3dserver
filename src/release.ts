@@ -1,5 +1,9 @@
-export const appVersion = '1.1.3'
+export const appVersion = '1.2.0'
 export const releases = [
+  { version: '1.2.0', date: '2026-11-18', title: 'Chat3D 客户端接入', changes: [
+    '兼容 Chat3D 的团队登录、分块发布、固定版本获取，以及看板上传、读取和截图管理。',
+    '管理页展示可编辑快照，保留原始 JSON、动画与历史版本；GLB 入库流程不变。',
+  ] },
   { version: '1.1.3', date: '2026-11-17', title: '统一日夜主题开关', changes: [
     '登录页、工作区和设置页统一使用太阳／月亮胶囊滑块，支持键盘切换和偏好保存。',
     '移除主题下拉选择器和旧单图标按钮。',

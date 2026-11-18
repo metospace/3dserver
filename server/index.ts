@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDatabase, publicUser, type UserRow } from './db.js';
 import { createAuth, type AuthRequest } from './auth.js';
+import { createTeamApi } from './team.js';
 import { HttpError, text, tags, objectBody, originalFilename, validateGlb, validatePng } from './validation.js';
 import { prepareDashboard, loadManifest, loadPackage, syncFile, PACKAGE_UPLOAD_LIMIT } from './dashboard.js';
 import type { Kind, Role, Category, Version, ModelRecord } from '../src/contracts.js';
@@ -24,6 +25,9 @@ const auth = createAuth(db);
 const app = express();
 app.disable('x-powered-by');
 if (process.env.TRUST_PROXY === '1') app.set('trust proxy', 1);
+
+const team = createTeamApi(db, auth, { fileDir, tempDir, dashboardDir });
+app.get('/team/sso/callback', team.callback);
 
 interface RecordRow {
   id: string; kind: Kind; name: string; description: string; tags: string;
@@ -66,6 +70,7 @@ app.use((req, res, next) => {
   if (req.secure) res.setHeader('Strict-Transport-Security', 'max-age=31536000');
   next();
 });
+app.use('/api/team', team.router);
 app.use('/api', (req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
@@ -467,7 +472,12 @@ app.patch('/api/records/:id', route((req, res) => {
   }).immediate();
   res.json(result);
 }));
-app.post('/api/records/:id/versions', gate(req => recordAccess(req.user!, req.params.id!, true)), upload(libraryUpload), route(async (req, res) => {
+app.post('/api/records/:id/versions', gate(req => {
+  const record = recordAccess(req.user!, req.params.id!, true);
+  if (db.prepare("SELECT 1 FROM versions WHERE id=? AND source_kind='chat3d'").get(record.current_version_id)) {
+    throw new HttpError(409, '可编辑原件请在 Chat3D 中发布新版本，GLB 请另行入库');
+  }
+}), upload(libraryUpload), route(async (req, res) => {
   const record = recordAccess(req.user!, req.params.id!, true);
   const body = objectBody(req.body), key = idempotencyKey(body), files = uploadedFiles(req);
   checkUploadLimits(record.kind, files);
@@ -483,6 +493,9 @@ app.post('/api/records/:id/versions', gate(req => recordAccess(req.user!, req.pa
       const existing = replay(req.user!.id, key, digest);
       if (existing !== undefined) return existing;
       checkRevision(latest, expected); requireActive(latest);
+      if (db.prepare("SELECT 1 FROM versions WHERE record_id=? AND source_kind='chat3d' LIMIT 1").get(record.id)) {
+        throw new HttpError(409, '可编辑原件请在 Chat3D 中发布新版本，GLB 请另行入库');
+      }
       const previous = db.prepare('SELECT COALESCE(MAX(number),0) AS number FROM versions WHERE record_id=?').get(record.id) as { number: number };
       const now = new Date().toISOString();
       insertVersion(prepared, record.id, previous.number + 1, note, now, req.user!.id);
@@ -545,6 +558,11 @@ app.get('/api/versions/:id/file', route((req, res) => {
 }));
 app.get('/api/versions/:id/source', route((req, res) => {
   const { version, record } = versionAccess(req.user!, req.params.id!);
+  if (version.source_kind === 'chat3d') {
+    res.attachment(version.original_name).type('application/json');
+    sendStoredFile(res, path.join(fileDir, `${version.id}.json`));
+    return;
+  }
   if (record.kind !== 'dashboard') throw new HttpError(400, '此接口仅用于大屏源文件');
   res.attachment(version.source_kind === 'folder' ? 'dashboard.zip' : version.original_name);
   res.type(version.source_kind === 'html' ? 'text/html' : 'application/zip');
@@ -566,7 +584,9 @@ app.get('/api/versions/:id/package', route(async (req, res) => {
 app.get('/api/versions/:id/thumbnail', route((req, res) => {
   const { version } = versionAccess(req.user!, req.params.id!);
   if (!version.has_thumbnail) throw new HttpError(404, '缩略图不存在');
-  res.type('image/png'); sendStoredFile(res, path.join(fileDir, version.thumbnail_path ?? `${version.id}.png`));
+  const filename = version.thumbnail_path ?? `${version.id}.png`;
+  res.type(filename.endsWith('.jpg') ? 'image/jpeg' : 'image/png');
+  sendStoredFile(res, path.join(fileDir, filename));
 }));
 app.post('/api/versions/:id/thumbnail', gate(req => versionAccess(req.user!, req.params.id!, true)), upload(thumbnailUpload), route(async (req, res) => {
   const { version } = versionAccess(req.user!, req.params.id!, true);
@@ -632,12 +652,12 @@ const server = app.listen(port, process.env.HOST || '127.0.0.1', () => {
   if (address && typeof address !== 'string') console.log(`Scenivo 服务已启动：http://${process.env.HOST || '127.0.0.1'}:${address.port}`);
 });
 server.requestTimeout = MODEL_TIMEOUT_MS; server.headersTimeout = 15000;
-server.on('error', error => { console.error('服务启动失败', error); auth.close(); db.close(); process.exitCode = 1; });
+server.on('error', error => { console.error('服务启动失败', error); team.close(); auth.close(); db.close(); process.exitCode = 1; });
 let stopping = false;
 function shutdown() {
   if (stopping) return;
   stopping = true;
   const force = setTimeout(() => { server.closeAllConnections(); }, 10000); force.unref();
-  server.close(() => { clearTimeout(force); auth.close(); db.close(); });
+  server.close(() => { clearTimeout(force); team.close(); auth.close(); db.close(); });
 }
 process.once('SIGTERM', shutdown); process.once('SIGINT', shutdown);
