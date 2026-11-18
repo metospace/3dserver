@@ -1,15 +1,16 @@
 import express, { type RequestHandler } from 'express';
 import type Database from 'better-sqlite3';
-import type { AuthRequest, PasswordVerifier } from './auth.js';
+import type { AuthRequest, TeamAuthHost } from './auth.js';
 import { HttpError, objectBody } from './validation.js';
 import { createTeamAuth } from './team-auth.js';
 import { createTeamDashboards } from './team-dashboards.js';
 import { openTeamPublications, TEAM_MAX_BYTES, teamJson, teamRoute } from './team-publications.js';
 import { createTeamPublishUploads } from './team-publish-uploads.js';
+import { requireReceiptRecord, type ResourceFileDeletions } from './resource-files.js';
 
-export function createTeamApi(db: Database.Database, auth: PasswordVerifier, paths: {
+export function createTeamApi(db: Database.Database, auth: TeamAuthHost, paths: {
   fileDir: string; tempDir: string; dashboardDir: string;
-}) {
+}, fileDeletions: ResourceFileDeletions) {
   const router = express.Router();
   const desktopOrigins = ['http://tauri.localhost', 'https://tauri.localhost', 'tauri://localhost'];
   const origins = new Set((process.env.CHAT3D_TEAM_ORIGINS ?? '').split(',').map(origin => origin.trim()).filter(Boolean));
@@ -53,10 +54,12 @@ export function createTeamApi(db: Database.Database, auth: PasswordVerifier, pat
   };
   router.post('/publish', reserveLegacy, ...teamJson(TEAM_MAX_BYTES), teamRoute(async (req, res) => {
     const user = await sessions.authenticate(req, true);
-    res.json(await publications.publish(user, objectBody(req.body)));
+    const published = await publications.publish(user, objectBody(req.body));
+    requireReceiptRecord(db, published.id);
+    res.json(published);
   }));
   router.use('/publish-uploads', createTeamPublishUploads(db, paths.tempDir, sessions.authenticate, publications.publish));
-  router.use('/dashboards', createTeamDashboards({ db, ...paths, authenticate: sessions.authenticate }));
+  router.use('/dashboards', createTeamDashboards({ db, ...paths, fileDeletions, authenticate: sessions.authenticate }));
   router.use((_req, _res, next) => next(new HttpError(404, '接口不存在')));
-  return { router, callback: sessions.callback, close: sessions.close };
+  return { router, management: sessions.management, callback: sessions.callback, close: sessions.close };
 }

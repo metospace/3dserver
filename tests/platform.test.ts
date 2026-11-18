@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -370,10 +370,56 @@ test('Chat3D sessions, resumable publications and historical reads share the man
     assert.equal((await teamRequest<TeamItem[]>(base, 'items?kind=scene', { token: viewer }))[0]!.version, 2)
     const third = await teamRequest<TeamItem>(base, 'publish', { token, body: { ...replacement, key: randomUUID(), expectedVersion: 2 } })
     assert.equal(third.version, 3)
+    const beforeDelete = await manager.request<Detail>(`/records/${first.id}`)
+    await manager.request(`/records/${first.id}`, 'DELETE', { expectedRevision: beforeDelete.record.revision }, 204)
+    assert.deepEqual(await teamRequest(base, 'items?kind=scene', { token: viewer }), [])
+    for (const version of beforeDelete.versions) {
+      await teamRequest(base, `items/${first.id}/${version.number}`, { token: viewer, status: 404 })
+      await manager.binary(`/versions/${version.id}/source`, 404)
+    }
+    await teamRequest(base, 'publish-uploads/start', { token, body: startBody, status: 410 })
+    await teamRequest(base, `publish-uploads/${upload.uploadId}/complete`, { token, body: {}, status: 410 })
+    await teamRequest(base, 'publish', { token, body: replacement, status: 410 })
+    assert.deepEqual(await readdir(join(directory, 'files')), [])
     await manager.request(`/users/${publisher.id}`, 'PATCH', { role: 'viewer' })
     await teamRequest(base, 'me', { token, status: 401 })
     await teamRequest(base, 'logout', { token: viewer, body: {} })
     await teamRequest(base, 'items?kind=scene', { token: viewer, status: 401 })
+  } finally {
+    if (running) await stop(running.child)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('administrators can delete complete native models without affecting other resources', { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), '3dserver-delete-'))
+  let running: RunningServer | undefined
+  try {
+    running = await start(directory)
+    const admin = new Client(running.base), editor = new Client(running.base)
+    await admin.request('/setup', 'POST', { username: 'admin', password: 'example-admin', displayName: '管理员' }, 201)
+    await admin.request('/users', 'POST', { username: 'editor', password: 'example-editor', displayName: '编辑者', role: 'editor' }, 201)
+    await editor.request('/login', 'POST', { username: 'editor', password: 'example-editor' })
+    const binary = glb(), fields = { kind: 'asset', name: '待删资产', idempotencyKey: randomUUID() }
+    const asset = await editor.upload('/records?kind=asset', binary, fields)
+    const record = `/records/${asset.id}`
+    const second = await editor.upload<Version>(`${record}/versions`, binary, { expectedRevision: String(asset.revision) })
+    await editor.upload(`/versions/${second.id}/thumbnail`, screenshotPng(), {}, 204, 'thumbnail.png')
+    const scene = await admin.upload('/records?kind=scene', binary, { kind: 'scene', name: '保留场景' })
+    const board = await admin.upload('/records?kind=dashboard', Buffer.from('<h1>保留看板</h1>'), { kind: 'dashboard', name: '保留看板' }, 201, 'index.html')
+    await admin.request(`/records/${board.id}`, 'DELETE', { expectedRevision: board.revision }, 400)
+    await editor.request(record, 'DELETE', { expectedRevision: asset.revision + 1 }, 403)
+    const stale = await admin.request<Failure>(record, 'DELETE', { expectedRevision: asset.revision }, 409)
+    assert.equal(stale.code, 'VERSION_CONFLICT')
+    const archived = await admin.request<ModelRecord>(`${record}/archive`, 'PATCH', { archived: true, expectedRevision: stale.currentRevision })
+    await admin.request(record, 'DELETE', { expectedRevision: archived.revision }, 204)
+    assert.deepEqual(await admin.request('/records?kind=asset&includeArchived=1'), [])
+    await admin.request(record, 'GET', undefined, 404)
+    await admin.binary(`/versions/${asset.currentVersionId}/file`, 404)
+    await admin.binary(`/versions/${second.id}/thumbnail`, 404)
+    await editor.upload('/records?kind=asset', binary, fields, 410)
+    assert.deepEqual(await admin.binary(`/versions/${scene.currentVersionId}/file`), binary)
+    assert.deepEqual(await readdir(join(directory, 'files')), [`${scene.currentVersionId}.glb`])
   } finally {
     if (running) await stop(running.child)
     await rm(directory, { recursive: true, force: true })
@@ -456,7 +502,37 @@ test('Chat3D OAuth callback exchanges an exact redirect, claims once, and isolat
     const claim = await teamRequest<{ platform: { accessToken: string } }>(base, 'login/sso/claim', { body: { state } })
     assert.equal(claim.platform.accessToken, 'test-provider-access')
     await teamRequest(base, 'login/sso/claim', { body: { state }, status: 404 })
+
+    assert.deepEqual(await manager.request('/auth/sso'), { available: true })
+    await manager.request('/auth/sso/start', 'POST', {}, 403, { Origin: 'https://untrusted.example.test' })
+    const startResponse = await fetch(`${base}/api/auth/sso/start`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    assert.equal(startResponse.status, 200)
+    const stateCookie = startResponse.headers.get('set-cookie')!
+    assert.match(stateCookie, /HttpOnly; SameSite=Lax/)
+    const authorize = new URL((await startResponse.json()).url)
+    const params = new URLSearchParams(authorize.hash.split('?')[1])
+    const managerRedirect = params.get('redirect_uri')!
+    assert.equal(managerRedirect, `${base}/api/auth/sso/callback`)
+    const managerCallback = `${managerRedirect}?code=management-test-code&state=${params.get('state')}`
+    const noCookie = await fetch(managerCallback, { redirect: 'manual' })
+    assert.equal(noCookie.headers.get('location'), '/?sso=expired')
+    assert.equal(tokenRequests, 1)
+    const boundCallback = () => fetch(managerCallback, { redirect: 'manual', headers: { Cookie: stateCookie.split(';')[0]! } })
+    const authorized = await boundCallback()
+    assert.equal(authorized.headers.get('location'), '/')
+    const browserSession = authorized.headers.getSetCookie().find(cookie => cookie.startsWith('glb_session='))!
+    assert.match(browserSession, /HttpOnly; SameSite=Strict/)
+    const web = new Client(base); web.cookie = browserSession.split(';')[0]!
+    const { user: collaborative } = await web.request<{ user: User }>('/me')
+    assert.equal(collaborative.id, result.user.id)
+    assert.equal(collaborative.role, 'editor')
+    await web.request('/users', 'GET', undefined, 403)
+    assert.equal((await boundCallback()).headers.get('location'), '/?sso=expired')
+    assert.equal(tokenRequests, 2)
     revoked = true
+    await web.request('/categories', 'POST', { kind: 'asset', name: '已失效' }, 401)
+    await web.request('/me', 'GET', undefined, 401)
+    assert.equal((await manager.request<{ user: User }>('/me')).user.id, admin.id)
     await teamRequest(base, 'publish-uploads/start', { token: result.token, body: { key: randomUUID(), encoding: 'gzip', digest: '0'.repeat(64), total: 10 }, status: 401 })
     await teamRequest(base, 'me', { token: result.token, status: 401 })
   } finally {

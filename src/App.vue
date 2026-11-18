@@ -25,6 +25,8 @@ const modules: { kind: Kind; label: string; icon: string }[] = [
 ]
 const booting = ref(true)
 const setupRequired = ref(false)
+const loginMode = ref<'password' | 'oauth'>('password')
+const oauthAvailable = ref(false)
 const user = ref<User | null>(null)
 const login = ref({ username: '', password: '', displayName: '' })
 const error = ref('')
@@ -45,7 +47,7 @@ const selectedVersionId = ref('')
 const dashboardPreviewId = ref('')
 const manifest = ref<DashboardManifest | null>(null)
 const manifestLoading = ref(false)
-const modal = ref<'' | 'upload' | 'version' | 'edit' | 'categories' | 'accounts' | 'thumbnails' | 'note'>('')
+const modal = ref<'' | 'upload' | 'version' | 'edit' | 'categories' | 'accounts' | 'thumbnails' | 'note' | 'delete'>('')
 const metaForm = ref({ name: '', description: '', tags: '', categoryId: '' })
 const metaRevision = ref(0)
 const conflict = ref('')
@@ -117,6 +119,7 @@ async function loadRoute() {
   settingsOpen.value = false
   const nextKind: Kind = parts[0] === 'scene' ? 'scene' : parts[0] === 'dashboard' ? 'dashboard' : parts[0] === 'asset' ? 'asset' : preferences.value.defaultLibrary
   if (kind.value !== nextKind) { query.value = ''; tag.value = ''; categoryId.value = ''; categories.value = []; records.value = []; sort.value = preferences.value.defaultSort }
+  if (modal.value === 'delete') modal.value = ''
   kind.value = nextKind; detail.value = null; dashboardPreviewId.value = ''; manifest.value = null; conflict.value = ''; thumbnailRequest.value = null; thumbnailError.value = ''; modelReadyVersion.value = ''; captureError.value = ''; loading.value = true; error.value = ''
   try {
     await refreshCategories()
@@ -130,10 +133,21 @@ async function loadRoute() {
   } catch (cause) { if (sequence === routeSequence) report(cause) }
   finally { if (sequence === routeSequence) loading.value = false }
 }
+function selectLoginMode(mode: 'password' | 'oauth') {
+  loginMode.value = mode; error.value = ''
+}
+async function startOAuth() {
+  if (!oauthAvailable.value) return
+  await act(async () => {
+    const { url } = await api<{ url: string }>('/auth/sso/start', { method: 'POST', body: '{}' })
+    window.location.assign(url)
+  })
+}
 async function authenticate() {
   await act(async () => {
     user.value = (await api<{ user: User }>(setupRequired.value ? '/setup' : '/login', { method: 'POST', body: json(login.value) })).user
     setupRequired.value = false; login.value.password = ''; await loadRoute()
+    oauthAvailable.value = (await api<{ available: boolean }>('/auth/sso')).available
   })
 }
 async function logout() {
@@ -182,6 +196,17 @@ async function archive() {
     dashboardPreviewId.value = ''; await refreshRecords(); notice.value = detail.value.record.archived ? '条目已归档' : '已取消归档'
   })
 }
+async function deleteRecord() {
+  const record = detail.value?.record
+  if (!record || record.kind === 'dashboard') return
+  await act(async () => {
+    await api(`/records/${encodeURIComponent(record.id)}`, { method: 'DELETE', body: json({ expectedRevision: record.revision }) })
+    modal.value = ''
+    notice.value = `已永久删除「${record.name}」`
+    if (detail.value?.record.id === record.id) navigate()
+    else await refreshRecords()
+  })
+}
 async function loadManifest() {
   const id = selectedVersionId.value
   manifestLoading.value = true; error.value = ''
@@ -206,6 +231,12 @@ async function screenshotSelected(event: Event) {
   if (!file || !selectedVersion.value) return
   if (!/\.png$/i.test(file.name) || file.size > 2 * 1024 * 1024) { error.value = '截图必须是 2 MB 以内的 PNG 文件'; return }
   thumbnailRequest.value = { versionId: selectedVersion.value.id, file, key: createUuid() }; await sendThumbnail()
+}
+async function dashboardCaptured(versionId: string, file: Blob) {
+  if (dashboardPreviewId.value !== versionId || !canEdit.value || busy.value || thumbnailRequest.value) return
+  dashboardPreviewId.value = ''
+  thumbnailRequest.value = { versionId, file, key: createUuid() }
+  await sendThumbnail()
 }
 async function capturePreview(onlyMissing = false) {
   const version = selectedVersion.value
@@ -255,6 +286,15 @@ onMounted(async () => {
     if (!setupRequired.value) {
       try { user.value = (await api<{ user: User }>('/me')).user; await loadRoute() }
       catch (cause) { if (!(cause instanceof ApiError && cause.status === 401)) report(cause) }
+      oauthAvailable.value = (await api<{ available: boolean }>('/auth/sso')).available
+      if (!user.value) {
+        const url = new URL(window.location.href), failure = url.searchParams.get('sso')
+        if (failure !== null) {
+          url.searchParams.delete('sso'); window.history.replaceState(null, '', url)
+          loginMode.value = 'oauth'
+          error.value = failure === 'denied' ? '你取消了协同授权，可以重新发起。' : failure === 'expired' ? '授权已失效，请重新发起。' : '协同授权失败，请重试或联系管理员。'
+        }
+      }
     }
   } catch (cause) { report(cause) } finally { booting.value = false }
 })
@@ -265,7 +305,26 @@ onUnmounted(() => { window.removeEventListener('hashchange', loadRoute) })
   <div v-if="booting" class="boot"><span class="spinner" />正在连接资源库…</div>
   <main v-else-if="!user" class="auth-shell">
     <section class="auth-story"><a class="brand" href="#/"><BrandLogo /></a><div class="auth-art" aria-hidden="true"><div class="orbit orbit-one" /><div class="orbit orbit-two" /><img src="/scenivo.svg" alt="" width="132" height="132"></div><h1>让每次创作，<br>都有自己的位置。</h1></section>
-    <section class="auth-panel"><ThemeToggle /><form class="auth-form" @submit.prevent="authenticate"><h2>{{ setupRequired ? '创建管理员账号' : '登录工作空间' }}</h2><label>用户名<input v-model="login.username" required pattern="[A-Za-z0-9_-]{3,40}" minlength="3" maxlength="40" autocomplete="username" placeholder="至少 3 位字母、数字、_ 或 -"></label><label v-if="setupRequired">显示名称<input v-model="login.displayName" required maxlength="80" autocomplete="name"></label><label>密码<input v-model="login.password" type="password" required :minlength="setupRequired ? 6 : 1" maxlength="200" :autocomplete="setupRequired ? 'new-password' : 'current-password'"></label><p v-if="error" class="error-box" role="alert">{{ error }}</p><button class="primary auth-submit" :disabled="busy">{{ busy ? '正在连接…' : setupRequired ? '创建账号并进入' : '登录' }}<AppIcon name="arrow" :size="18" /></button></form></section>
+    <section class="auth-panel">
+      <ThemeToggle />
+      <form class="auth-form" @submit.prevent="loginMode === 'oauth' && !setupRequired ? startOAuth() : authenticate()">
+        <h2>{{ setupRequired ? '创建管理员账号' : '登录工作空间' }}</h2>
+        <div v-if="!setupRequired" class="auth-modes" role="group" aria-label="登录方式">
+          <button type="button" :aria-pressed="loginMode === 'password'" :disabled="busy" @click="selectLoginMode('password')">账号密码</button>
+          <button type="button" :aria-pressed="loginMode === 'oauth'" :disabled="busy" @click="selectLoginMode('oauth')">协同授权</button>
+        </div>
+        <template v-if="setupRequired || loginMode === 'password'">
+          <label>用户名<input v-model="login.username" required pattern="[A-Za-z0-9_.\-]{3,40}" minlength="3" maxlength="40" autocomplete="username"></label>
+          <label v-if="setupRequired">显示名称<input v-model="login.displayName" required maxlength="80" autocomplete="name"></label>
+          <label>密码<input v-model="login.password" type="password" required :minlength="setupRequired ? 6 : 1" maxlength="200" :autocomplete="setupRequired ? 'new-password' : 'current-password'"></label>
+        </template>
+        <p v-else class="fine">{{ oauthAvailable ? '在协同平台完成授权后自动返回工作空间。' : '当前服务未启用协同授权，或访问地址不是已登记的授权域名。请使用账号密码登录或联系管理员。' }}</p>
+        <p v-if="error" class="error-box" role="alert">{{ error }}</p>
+        <button class="primary auth-submit" :disabled="busy || (!setupRequired && loginMode === 'oauth' && !oauthAvailable)">
+          {{ busy ? '正在连接…' : setupRequired ? '创建账号并进入' : loginMode === 'oauth' ? '前往协同授权' : '登录' }}<AppIcon name="arrow" :size="18" />
+        </button>
+      </form>
+    </section>
   </main>
   <div v-else class="app-shell library-app">
     <aside class="sidebar"><a class="brand" href="#/"><BrandLogo /></a><div class="workspace-label">团队资源空间<span class="online-dot" /></div><nav class="module-navigation" aria-label="资源库"><button v-for="module in modules" :key="module.kind" :class="{ active: !settingsOpen && kind === module.kind }" @click="navigate(module.kind)"><AppIcon :name="module.icon" :size="19" /><span>{{ module.label }}</span><AppIcon v-if="!settingsOpen && kind === module.kind" name="arrow" :size="14" /></button></nav><div class="sidebar-bottom"><a class="sidebar-action settings-link" :class="{ active: settingsOpen }" href="#/settings"><AppIcon name="settings" :size="18" />设置</a><div class="user-row"><span class="avatar">{{ user.displayName.slice(0, 1) }}</span><div><strong>{{ user.displayName }}</strong><small>{{ roleLabel }}</small></div><button class="icon-button" title="退出登录" aria-label="退出登录" :disabled="busy" @click="logout"><AppIcon name="logout" :size="18" /></button></div></div></aside>
@@ -283,7 +342,12 @@ onUnmounted(() => { window.removeEventListener('hashchange', loadRoute) })
         </section></template>
       <template v-else>
         <section class="detail-heading"><div><button class="back-link" @click="navigate()"><AppIcon name="back" :size="16" />返回{{ activeModule.label }}</button><h1>{{ detail.record.name }}<span class="type-badge">{{ activeModule.label }}</span><span v-if="detail.record.archived" class="archived-badge">已归档</span></h1></div>
-          <div class="heading-actions"><button v-if="user.role === 'admin'" class="secondary" :disabled="busy || !!conflict" @click="archive">{{ detail.record.archived ? '取消归档' : '归档' }}</button><button v-if="canEdit" class="secondary" @click="openEdit"><AppIcon name="edit" :size="16" />编辑信息</button><button v-if="canEdit && !detail.record.archived && detail.record.currentVersion.sourceKind !== 'chat3d'" class="primary" @click="modal = 'version'"><AppIcon name="upload" :size="17" />上传新版本</button></div>
+          <div class="heading-actions">
+            <button v-if="user.role === 'admin'" class="secondary" :disabled="busy || !!conflict" @click="archive">{{ detail.record.archived ? '取消归档' : '归档' }}</button>
+            <button v-if="canEdit" class="secondary" @click="openEdit"><AppIcon name="edit" :size="16" />编辑信息</button>
+            <button v-if="user.role === 'admin' && kind !== 'dashboard'" class="secondary danger-link" :disabled="busy || !!conflict" @click="error = ''; modal = 'delete'">删除{{ kind === 'asset' ? '资产' : '场景' }}</button>
+            <button v-if="canEdit && !detail.record.archived && detail.record.currentVersion.sourceKind !== 'chat3d'" class="primary" @click="modal = 'version'"><AppIcon name="upload" :size="17" />上传新版本</button>
+          </div>
         </section>
         <div class="detail-layout">
           <section class="viewer-panel">
@@ -308,7 +372,16 @@ onUnmounted(() => { window.removeEventListener('hashchange', loadRoute) })
     <AccountDialog v-if="modal === 'accounts' && user.role === 'admin'" @close="modal = ''" @changed="accountChanged" />
     <div v-if="modal === 'edit'" class="modal-overlay" @click.self="!busy && (modal = '')"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="edit-title"><header class="modal-header"><h2 id="edit-title">编辑条目信息</h2><button class="icon-button" :disabled="busy" aria-label="关闭" @click="modal = ''"><AppIcon name="close" /></button></header><p v-if="error" class="error-box" role="alert">{{ error }}</p><div v-if="conflict" class="conflict-box"><p>{{ conflict }}待编辑内容会保留。</p><button class="text-link" :disabled="busy" @click="reloadLatest">重新读取最新版本，保留待编辑内容</button></div><form class="stack-form" @submit.prevent="saveMeta"><label>名称<input v-model="metaForm.name" required maxlength="160" :disabled="busy"></label><label>描述<textarea v-model="metaForm.description" maxlength="4000" rows="3" :disabled="busy" /></label><label>标签<input v-model="metaForm.tags" maxlength="1000" placeholder="逗号分隔" :disabled="busy"></label><label>分类<select v-model="metaForm.categoryId" :disabled="busy"><option value="">未分类</option><option v-for="category in categories" :key="category.id" :value="category.id">{{ category.parentId ? `${categories.find(parent => parent.id === category.parentId)?.name} / ` : '' }}{{ category.name }}</option></select></label><footer class="modal-footer"><button type="button" class="secondary" :disabled="busy" @click="modal = ''">取消</button><button class="primary" :disabled="busy || !!conflict || !metaForm.name.trim()">保存修改</button></footer></form></section></div>
     <ThumbnailBackfill v-if="modal === 'thumbnails'" :records="missingThumbnails" @close="modal = ''" @changed="thumbnailsChanged" />
+    <div v-if="modal === 'delete' && detail" class="modal-overlay" @click.self="!busy && (modal = '')">
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="delete-title">
+        <header class="modal-header"><h2 id="delete-title">删除{{ kind === 'asset' ? '资产' : '场景' }}</h2></header>
+        <p>永久删除「{{ detail.record.name }}」及其全部 {{ detail.versions.length }} 个版本和缩略图。团队历史链接将失效，已获取的本机副本不受影响。此操作不可撤销。</p>
+        <p v-if="error" class="error-box" role="alert">{{ error }}</p>
+        <div v-if="conflict" class="conflict-box"><p>{{ conflict }}</p><button class="text-link" :disabled="busy" @click="reloadLatest">重新读取最新版本</button></div>
+        <footer class="modal-footer"><button class="secondary" :disabled="busy" @click="modal = ''">取消</button><button class="secondary danger-link" :disabled="busy || !!conflict" @click="deleteRecord">确认永久删除</button></footer>
+      </section>
+    </div>
     <div v-if="modal === 'note' && noteVersion" class="modal-overlay"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="note-title"><header class="modal-header"><h2 id="note-title">修改 v{{ noteVersion.number }} 说明</h2><button class="icon-button" :disabled="busy" aria-label="关闭说明编辑" @click="modal = ''"><AppIcon name="close" /></button></header><p v-if="error" class="error-box" role="alert">{{ error }}</p><div v-if="conflict" class="conflict-box"><p>{{ conflict }}</p><button class="text-link" :disabled="busy" @click="reloadNoteBaseline">重新读取最新版本，保留输入</button></div><form class="stack-form" @submit.prevent="saveVersionNote"><label>版本说明<textarea v-model="noteText" rows="4" maxlength="2000" :disabled="busy" /></label><footer class="modal-footer"><button type="button" class="secondary" :disabled="busy" @click="modal = ''">取消</button><button class="primary" :disabled="busy || !!conflict">保存说明</button></footer></form></section></div>
-    <DashboardViewer v-if="dashboardPreviewId && detail" :version-id="dashboardPreviewId" :title="detail.record.name" @close="dashboardPreviewId = ''" />
+    <DashboardViewer v-if="dashboardPreviewId && detail" :key="dashboardPreviewId" :version-id="dashboardPreviewId" :title="detail.record.name" :can-capture="canEdit && !busy && !thumbnailRequest" @close="dashboardPreviewId = ''" @captured="dashboardCaptured" />
   </div>
 </template>

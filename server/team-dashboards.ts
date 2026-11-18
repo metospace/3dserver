@@ -9,12 +9,14 @@ import type { UserRow } from './db.js';
 import { HttpError, objectBody, text } from './validation.js';
 import { screenshotPng } from './team-dashboard-png.js';
 import { dashboardHash, openDashboardUploads, sourceFilename, syncDirectory, teamSourceKind } from './team-dashboard-uploads.js';
+import type { ResourceFileDeletions } from './resource-files.js';
 
 interface Options {
   db: Database.Database;
   dashboardDir: string;
   fileDir: string;
   tempDir: string;
+  fileDeletions: ResourceFileDeletions;
   authenticate(req: Request, force?: boolean): Promise<UserRow>;
 }
 interface Screenshot {
@@ -78,7 +80,7 @@ function binary(res: Response, next: NextFunction, filename: string, fileName: s
   });
 }
 
-export function createTeamDashboards({ db, dashboardDir, fileDir, tempDir, authenticate }: Options): express.Router {
+export function createTeamDashboards({ db, dashboardDir, fileDir, tempDir, fileDeletions, authenticate }: Options): express.Router {
   db.exec(`
     CREATE TABLE IF NOT EXISTS team_dashboard_metadata (
       version_id TEXT PRIMARY KEY REFERENCES versions(id) ON DELETE CASCADE,
@@ -214,7 +216,7 @@ export function createTeamDashboards({ db, dashboardDir, fileDir, tempDir, authe
       metadata=excluded.metadata,previous_thumbnail=excluded.previous_thumbnail,previous_path=excluded.previous_path`);
   const updateThumbnail = db.prepare('UPDATE versions SET has_thumbnail=?,thumbnail_path=? WHERE id=?');
   const deleteShot = db.prepare('DELETE FROM team_dashboard_screenshots WHERE version_id=?');
-  const lastShotId = db.prepare('SELECT id FROM team_dashboard_screenshots WHERE version_id=?');
+  const lastShot = db.prepare('SELECT filename,previous_thumbnail,previous_path FROM team_dashboard_screenshots WHERE version_id=?');
   const dropImage = (id: string) => rm(path.join(fileDir, screenshotFilename(id)), { force: true })
     .catch(error => console.error('清理看板截图失败', error));
   const commitShot = db.transaction((user: UserRow, shot: Screenshot, target: Row) => {
@@ -224,12 +226,18 @@ export function createTeamDashboards({ db, dashboardDir, fileDir, tempDir, authe
         current.hasThumbnail !== target.hasThumbnail || current.thumbnailPath !== target.thumbnailPath) {
       throw new HttpError(409, '截图或看板包已变更，请刷新后重试');
     }
-    const previous = lastShotId.get(current.versionId) as { id: string } | undefined;
+    const previous = lastShot.get(current.versionId) as
+      { filename: string; previous_thumbnail: number; previous_path: string | null } | undefined;
     upsertShot.run(current.versionId, shot.id, shot.packageHash, screenshotFilename(shot.id), JSON.stringify(shot),
       current.bindingId ? current.previousThumbnail : current.hasThumbnail,
       current.bindingId ? current.previousPath : current.thumbnailPath);
     updateThumbnail.run(1, screenshotFilename(shot.id), current.versionId);
-    return previous?.id;
+    if (previous) {
+      fileDeletions.enqueueThumbnail(current.versionId, previous.filename);
+      if (!current.bindingId && previous.previous_thumbnail) {
+        fileDeletions.enqueueThumbnail(current.versionId, previous.previous_path);
+      }
+    }
   });
   // Native startup cleanup also handles abandoned UUID staging files in tempDir.
   // Limit concurrent decoding: one valid 16 Mpx image may need 64 MiB of working memory.
@@ -259,9 +267,9 @@ export function createTeamDashboards({ db, dashboardDir, fileDir, tempDir, authe
       await writeFile(staged, image.bytes, { flag: 'wx', mode: 0o600 }); await syncFile(staged);
       await rename(staged, destination); moved = true;
       await syncDirectory(fileDir);
-      const previous = commitShot.immediate(await authenticate(req), shot, thumbnail);
+      commitShot.immediate(await authenticate(req), shot, thumbnail);
       retained = true;
-      if (previous) await dropImage(previous);
+      await fileDeletions.flush();
       res.json(shot);
     } finally {
       decoding = false;
@@ -277,12 +285,13 @@ export function createTeamDashboards({ db, dashboardDir, fileDir, tempDir, authe
     if (value.bindingId !== expected) throw new HttpError(409, '截图已变更，请刷新后重试');
     updateThumbnail.run(value.previousThumbnail, value.previousPath, value.versionId);
     deleteShot.run(value.versionId);
+    fileDeletions.enqueue(screenshotFilename(expected));
   });
   router.post('/:id/:version(\\d+)/screenshot/unbind', adminGate, metadataJson, forceAdmin, route(async (req, res) => {
     const { expectedScreenshotId } = objectKeys(req.body, ['expectedScreenshotId']);
     if (typeof expectedScreenshotId !== 'string') throw new HttpError(400, '截图解绑参数无效');
     unbind.immediate(admin(req.user), req.params.id, Number(req.params.version), expectedScreenshotId);
-    await dropImage(expectedScreenshotId);
+    await fileDeletions.flush();
     res.json({ ok: true });
   }));
   return router;

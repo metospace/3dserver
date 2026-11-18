@@ -4,7 +4,7 @@ import { MODEL_MAX_BYTES, MODEL_MAX_MB } from '../src/limits.js';
 
 export class HttpError extends Error {
   constructor(public readonly status: number, message: string,
-    public readonly code?: 'VERSION_CONFLICT' | 'IDEMPOTENCY_MISMATCH',
+    public readonly code?: 'VERSION_CONFLICT' | 'IDEMPOTENCY_MISMATCH' | 'RECORD_DELETED',
     public readonly currentRevision?: number) { super(message); }
 }
 

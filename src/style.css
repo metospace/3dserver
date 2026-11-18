@@ -1319,6 +1319,29 @@ dd {
 .auth-form label {
   font-size:11px
 }
+.auth-modes {
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:4px;
+  padding:4px;
+  border:1px solid var(--line);
+  border-radius:8px;
+  background:var(--input)
+}
+.auth-modes button {
+  min-height:36px;
+  border:0;
+  background:transparent;
+  justify-content:center;
+  border-radius:5px;
+  color:var(--muted)
+}
+.auth-modes button[aria-pressed="true"] {
+  background:var(--panel);
+  color:var(--text);
+  font-weight:600;
+  box-shadow:0 0 0 1px var(--line)
+}
 button:focus-visible,a:focus-visible {
   outline:2px solid var(--accent);
   outline-offset:3px

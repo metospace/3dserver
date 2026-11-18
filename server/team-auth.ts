@@ -2,11 +2,14 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import express, { type Request, type RequestHandler } from 'express';
 import type Database from 'better-sqlite3';
-import type { AuthRequest, PasswordVerifier } from './auth.js';
+import type { AuthRequest, TeamAuthHost } from './auth.js';
 import type { UserRow } from './db.js';
 import { HttpError, objectBody, text } from './validation.js';
 
 const CALLBACK_PATH = '/team/sso/callback';
+const MANAGEMENT_CALLBACK = '/api/auth/sso/callback';
+const MANAGEMENT_COOKIE = 'scenivo_oauth_state';
+const MANAGEMENT_STATE_TTL = 5 * 60 * 1000;
 const SESSION_AGE = 8 * 60 * 60 * 1000;
 const PLATFORM_RECHECK = 5 * 60 * 1000;
 const CLAIM_TTL = 5 * 60 * 1000;
@@ -50,7 +53,19 @@ function platformConfig() {
     try { clientSecret = readFileSync(env.CHAT3D_PLATFORM_OAUTH_CLIENT_SECRET_FILE, 'utf8').trim(); }
     catch { throw new Error('Cannot read CHAT3D_PLATFORM_OAUTH_CLIENT_SECRET_FILE'); }
   }
-  return { root, tenant, tokenPath, redirect, clientId, clientSecret, passwordLogin: env.CHAT3D_TEAM_PASSWORD_LOGIN !== '0' };
+  const managementRedirect = env.CHAT3D_MANAGEMENT_OAUTH_REDIRECT_URI?.trim();
+  if (managementRedirect) {
+    const url = httpUrl(managementRedirect);
+    if (url.pathname !== MANAGEMENT_CALLBACK || url.search || url.href !== managementRedirect) {
+      throw new Error(`CHAT3D_MANAGEMENT_OAUTH_REDIRECT_URI 必须指向 ${MANAGEMENT_CALLBACK}`);
+    }
+  }
+  const suppliedLogin = env.CHAT3D_PLATFORM_LOGIN_URL?.trim();
+  const ssoUi = (env.CHAT3D_PLATFORM_SSO_UI_BASE?.trim() || 'http://pm.jiezi365.com:48001').replace(/\/$/, '');
+  const managementLogin = root && clientId && clientSecret
+    ? suppliedLogin ? httpUrl(suppliedLogin).href : httpUrl(ssoUi).href.replace(/\/$/, '') + '/#/sso'
+    : undefined;
+  return { root, tenant, tokenPath, redirect, clientId, clientSecret, managementRedirect, managementLogin, passwordLogin: env.CHAT3D_TEAM_PASSWORD_LOGIN !== '0' };
 }
 
 function redirectFor(req: Request, configured?: string): string {
@@ -112,7 +127,7 @@ function platformTokens(result: Record<string, unknown>): PlatformTokens {
   return { accessToken, refreshToken, expiresTime };
 }
 
-export function createTeamAuth(db: Database.Database, auth: PasswordVerifier) {
+export function createTeamAuth(db: Database.Database, auth: TeamAuthHost) {
   const config = platformConfig();
   db.exec(`
     CREATE TABLE IF NOT EXISTS team_sessions (
@@ -133,6 +148,7 @@ export function createTeamAuth(db: Database.Database, auth: PasswordVerifier) {
   // Provider credentials must be available for revalidation, but never written to SQLite.
   const platformSessions = new Map<string, PlatformSession>();
   const pending = new Map<string, PendingClaim>();
+  const managementStates = new Map<string, { expires: number; redirect: string }>();
   const findSession = db.prepare(`SELECT u.*,s.platform_sso FROM team_sessions s JOIN users u ON u.id=s.user_id
     WHERE s.token_hash=? AND s.expires_at>?`);
   const addSession = db.prepare('INSERT INTO team_sessions (token_hash,user_id,expires_at,platform_sso) VALUES (?,?,?,?)');
@@ -151,6 +167,7 @@ export function createTeamAuth(db: Database.Database, auth: PasswordVerifier) {
 
   function pruneClaims(now: number) {
     for (const [key, claim] of pending) if (claim.expiresAt <= now) pending.delete(key);
+    for (const [key, state] of managementStates) if (state.expires <= now) managementStates.delete(key);
   }
   const timer = setInterval(() => {
     if (!db.open) { clearInterval(timer); return; }
@@ -285,6 +302,79 @@ export function createTeamAuth(db: Database.Database, auth: PasswordVerifier) {
     return issue(localUser.immediate(root, identity), { accessToken: token, subject: identity.subject });
   }
 
+  async function exchangeAuthorizationCode(root: string, code: string, redirect: string, state: string) {
+    if (!config.clientId || !config.clientSecret) throw new HttpError(503, '协同 OAuth client 尚未配置');
+    return platformTokens(await platformCall(root + config.tokenPath, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'tenant-id': config.tenant },
+      body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: redirect, client_id: config.clientId, client_secret: config.clientSecret, state }),
+    }, '协同授权码兑换失败'));
+  }
+
+  function managementRedirectFor(req: Request) {
+    const url = new URL(MANAGEMENT_CALLBACK, redirectFor(req));
+    if (config.managementRedirect && url.href !== config.managementRedirect) throw new HttpError(400, '请从配置的授权回调域名访问管理页');
+    return url.href;
+  }
+
+  const management = express.Router();
+  management.use((_req, res, next) => { res.set('Referrer-Policy', 'no-referrer'); next(); });
+  management.get('/', (req, res) => {
+    let available = Boolean(config.managementLogin && isInitialized.get());
+    if (available) { try { managementRedirectFor(req); } catch { available = false; } }
+    res.json({ available });
+  });
+  management.post('/start', (req, res, next) => {
+    try {
+      if (!req.is('application/json')) throw new HttpError(415, '需要 JSON');
+      if (!config.managementLogin) throw new HttpError(503, '协同授权尚未配置');
+      requireInitialized();
+      const redirect = managementRedirectFor(req), now = Date.now();
+      pruneClaims(now);
+      if (managementStates.size >= MAX_CLAIMS) throw new HttpError(429, '授权请求过多，请稍后重试');
+      const state = randomBytes(32).toString('hex');
+      managementStates.set(hash(state), { expires: now + MANAGEMENT_STATE_TTL, redirect });
+      res.cookie(MANAGEMENT_COOKIE, state, { httpOnly: true, sameSite: 'lax', secure: req.secure, path: MANAGEMENT_CALLBACK, maxAge: MANAGEMENT_STATE_TTL });
+      const url = new URL(config.managementLogin);
+      const hashRoute = url.hash.startsWith('#/');
+      const query = hashRoute ? new URLSearchParams(url.hash.split('?')[1]) : url.searchParams;
+      query.set('client_id', config.clientId); query.set('redirect_uri', redirect);
+      query.set('response_type', 'code'); query.set('state', state); query.delete('scope');
+      if (hashRoute) url.hash = `${url.hash.split('?')[0]}?${query}`;
+      res.json({ url: url.href });
+    } catch (error) { next(error); }
+  });
+  management.get('/callback', async (req, res, next) => {
+    const state = req.query.state;
+    const cookie = req.headers.cookie?.split(';').map(part => part.trim()).find(part => part.startsWith(`${MANAGEMENT_COOKIE}=`))?.slice(MANAGEMENT_COOKIE.length + 1);
+    res.clearCookie(MANAGEMENT_COOKIE, { path: MANAGEMENT_CALLBACK, httpOnly: true, secure: req.secure, sameSite: 'lax' });
+    res.set('Cache-Control', 'no-store');
+    const now = Date.now();
+    if (typeof state !== 'string' || !/^[a-f0-9]{64}$/.test(state) || state !== cookie) { res.redirect(303, '/?sso=expired'); return; }
+    const key = hash(state), pendingLogin = managementStates.get(key);
+    if (!pendingLogin || pendingLogin.expires <= now) { res.redirect(303, '/?sso=expired'); return; }
+    managementStates.delete(key);
+    if (req.query.error === 'access_denied') { res.redirect(303, '/?sso=denied'); return; }
+    try {
+      const root = platformRoot(), redirect = managementRedirectFor(req);
+      if (redirect !== pendingLogin.redirect) throw new HttpError(400, '授权回调地址不匹配');
+      requireInitialized();
+      const code = text(req.query.code, '授权码', 4096, 1, false);
+      const platform = await exchangeAuthorizationCode(root, code, redirect, state);
+      const identity = await platformIdentity(root, platform.accessToken);
+      const user = localUser.immediate(root, identity);
+      auth.issueSession(req, res, user, { expiresTime: platform.expiresTime, async verify() {
+        const current = await platformIdentity(root, platform.accessToken);
+        if (current.subject !== identity.subject) throw loginRequired();
+      } });
+      res.redirect(303, '/');
+    } catch (error) {
+      if (!(error instanceof HttpError)) console.error('协同授权登录失败', error);
+      if (res.headersSent) { next(error); return; }
+      res.redirect(303, '/?sso=failed');
+    }
+  });
+
   const router = express.Router();
   const requireUser: RequestHandler = (req, _res, next) => { void authenticate(req).then(() => next()).catch(next); };
   const json = express.json({ limit: '128kb', strict: true });
@@ -328,12 +418,7 @@ export function createTeamAuth(db: Database.Database, auth: PasswordVerifier) {
     const state = text(body.state, '授权 state', 256, 1);
     requireInitialized();
     return withClaim(state, async () => {
-      const result = await platformCall(root + config.tokenPath, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'tenant-id': config.tenant },
-        body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: redirect, client_id: clientId, client_secret: clientSecret, state }),
-      }, '协同授权码兑换失败');
-      const platform = platformTokens(result);
+      const platform = await exchangeAuthorizationCode(root, code, redirect, state);
       return { ...await loginPlatform(root, platform.accessToken), platform };
     });
   });
@@ -366,7 +451,7 @@ export function createTeamAuth(db: Database.Database, auth: PasswordVerifier) {
       res.send(callbackPage(nonce, redirect, config.tenant));
     } catch (error) { next(error); }
   };
-  return { router, requireUser, authenticate, callback, close: () => clearInterval(timer) };
+  return { router, management, requireUser, authenticate, callback, close: () => clearInterval(timer) };
 }
 
 function callbackPage(nonce: string, redirect: string, tenant: string): string {

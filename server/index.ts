@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { openDatabase, publicUser, type UserRow } from './db.js';
 import { createAuth, type AuthRequest } from './auth.js';
 import { createTeamApi } from './team.js';
+import { openResourceFileDeletions, requireReceiptRecord } from './resource-files.js';
 import { HttpError, text, tags, objectBody, originalFilename, validateGlb, validatePng } from './validation.js';
 import { prepareDashboard, loadManifest, loadPackage, syncFile, PACKAGE_UPLOAD_LIMIT } from './dashboard.js';
 import type { Kind, Role, Category, Version, ModelRecord } from '../src/contracts.js';
@@ -21,12 +22,14 @@ const tempDir = path.join(dataDir, 'tmp');
 const dashboardDir = path.join(dataDir, 'dashboards');
 for (const directory of [fileDir, tempDir, dashboardDir]) mkdirSync(directory, { recursive: true });
 const db = openDatabase(dataDir);
+const fileDeletions = openResourceFileDeletions(db, fileDir, syncDirectory);
 const auth = createAuth(db);
 const app = express();
 app.disable('x-powered-by');
 if (process.env.TRUST_PROXY === '1') app.set('trust proxy', 1);
 
-const team = createTeamApi(db, auth, { fileDir, tempDir, dashboardDir });
+const team = createTeamApi(db, auth, { fileDir, tempDir, dashboardDir }, fileDeletions);
+void fileDeletions.flush();
 app.get('/team/sso/callback', team.callback);
 
 interface RecordRow {
@@ -86,7 +89,9 @@ app.use('/api', (req, res, next) => {
   }
   next();
 });
-app.use('/api', express.json({ limit: '128kb', strict: true }), auth.authenticate);
+app.use('/api', express.json({ limit: '128kb', strict: true }));
+app.use('/api/auth/sso', team.management);
+app.use('/api', auth.authenticate);
 
 function kindValue(value: unknown): Kind {
   if (value !== 'asset' && value !== 'scene' && value !== 'dashboard') throw new HttpError(400, '类型必须为资产、场景或大屏');
@@ -384,6 +389,11 @@ function replay(userId: string, key: string, digest: string): string | undefined
   if (receipt.fingerprint !== digest) throw new HttpError(409, '此幂等请求编号已用于不同内容，请为新的操作生成新编号', 'IDEMPOTENCY_MISMATCH');
   return receipt.response;
 }
+function replayRecord(userId: string, key: string, digest: string): string | undefined {
+  const response = replay(userId, key, digest);
+  if (response !== undefined) requireReceiptRecord(db, (JSON.parse(response) as Pick<ModelRecord, 'id'>).id);
+  return response;
+}
 function saveReceipt(userId: string, key: string, digest: string, response: unknown): string {
   const encoded = JSON.stringify(response);
   db.prepare('INSERT INTO upload_receipts (user_id,key,fingerprint,response,created_at) VALUES (?,?,?,?,?)')
@@ -431,14 +441,14 @@ app.post('/api/records', gate(req => writeAccess(req.user!)), upload(libraryUplo
     tags: tags(body.tags, true), categoryId: body.categoryId === '' || body.categoryId === undefined ? null : body.categoryId,
     note: text(body.note, '版本说明', 2000), paths: body.paths ?? null, entry: body.entry ?? null };
   const digest = await fingerprint('create-record', null, input, files);
-  const prior = replay(req.user!.id, key, digest);
+  const prior = replayRecord(req.user!.id, key, digest);
   if (prior !== undefined) { res.status(201).type('json').send(prior); return; }
   const prepared = await prepareUpload(kind, files, body);
   let retained = false;
   try {
     const response = db.transaction(() => {
       writeAccess(req.user!, kind);
-      const existing = replay(req.user!.id, key, digest);
+      const existing = replayRecord(req.user!.id, key, digest);
       if (existing !== undefined) return existing;
       const categoryId = categoryAssignment(input.categoryId, kind);
       const recordId = randomUUID(), now = new Date().toISOString();
@@ -457,6 +467,26 @@ app.get('/api/records/:id', route((req, res) => {
   const record = recordAccess(req.user!, req.params.id!);
   const versions = db.prepare('SELECT * FROM versions WHERE record_id=? ORDER BY number DESC').all(record.id) as VersionRow[];
   res.json({ record: recordDto(record), versions: versions.map(versionDto) });
+}));
+app.delete('/api/records/:id', route(async (req, res) => {
+  adminAccess(req.user!);
+  const expected = revisionValue(objectBody(req.body).expectedRevision);
+  db.transaction(() => {
+    const record = recordAccess(req.user!, req.params.id!);
+    if (record.kind === 'dashboard') throw new HttpError(400, '只支持删除资产或场景');
+    checkRevision(record, expected);
+    const versions = db.prepare('SELECT id,source_kind,has_thumbnail,thumbnail_path FROM versions WHERE record_id=?').all(record.id) as
+      Pick<VersionRow, 'id' | 'source_kind' | 'has_thumbnail' | 'thumbnail_path'>[];
+    for (const version of versions) {
+      if (version.source_kind === 'glb') fileDeletions.enqueue(`${version.id}.glb`);
+      if (version.source_kind === 'chat3d') fileDeletions.enqueue(`${version.id}.json`);
+      if (version.has_thumbnail) fileDeletions.enqueueThumbnail(version.id, version.thumbnail_path);
+    }
+    db.prepare('DELETE FROM team_publication_versions WHERE version_id IN (SELECT id FROM versions WHERE record_id=?)').run(record.id);
+    db.prepare('DELETE FROM records WHERE id=?').run(record.id);
+  }).immediate();
+  await fileDeletions.flush();
+  res.sendStatus(204);
 }));
 app.patch('/api/records/:id', route((req, res) => {
   const body = objectBody(req.body), expected = revisionValue(body.expectedRevision);
@@ -601,13 +631,24 @@ app.post('/api/versions/:id/thumbnail', gate(req => versionAccess(req.user!, req
   try {
     await syncDirectory(fileDir);
     retained = db.transaction(() => {
-      versionAccess(req.user!, version.id, true);
+      const current = versionAccess(req.user!, version.id, true);
       if (replay(req.user!.id, key, digest) !== undefined) return false;
+      if (current.version.has_thumbnail) fileDeletions.enqueueThumbnail(version.id, current.version.thumbnail_path);
+      if (current.record.kind === 'dashboard') {
+        const shot = db.prepare(`DELETE FROM team_dashboard_screenshots WHERE version_id=?
+          RETURNING filename,previous_thumbnail,previous_path`).get(version.id) as
+          { filename: string; previous_thumbnail: number; previous_path: string | null } | undefined;
+        if (shot) {
+          fileDeletions.enqueueThumbnail(version.id, shot.filename);
+          if (shot.previous_thumbnail) fileDeletions.enqueueThumbnail(version.id, shot.previous_path);
+        }
+      }
       db.prepare('UPDATE versions SET has_thumbnail=1,thumbnail_path=? WHERE id=?').run(filename, version.id);
       saveReceipt(req.user!.id, key, digest, null);
       return true;
     }).immediate();
   } finally { if (!retained) await rm(destination, { force: true }); }
+  if (retained) await fileDeletions.flush();
   res.sendStatus(204);
 }));
 
@@ -652,12 +693,12 @@ const server = app.listen(port, process.env.HOST || '127.0.0.1', () => {
   if (address && typeof address !== 'string') console.log(`Scenivo 服务已启动：http://${process.env.HOST || '127.0.0.1'}:${address.port}`);
 });
 server.requestTimeout = MODEL_TIMEOUT_MS; server.headersTimeout = 15000;
-server.on('error', error => { console.error('服务启动失败', error); team.close(); auth.close(); db.close(); process.exitCode = 1; });
+server.on('error', error => { console.error('服务启动失败', error); fileDeletions.close(); team.close(); auth.close(); db.close(); process.exitCode = 1; });
 let stopping = false;
 function shutdown() {
   if (stopping) return;
   stopping = true;
   const force = setTimeout(() => { server.closeAllConnections(); }, 10000); force.unref();
-  server.close(() => { clearTimeout(force); team.close(); auth.close(); db.close(); });
+  server.close(() => { clearTimeout(force); fileDeletions.close(); team.close(); auth.close(); db.close(); });
 }
 process.once('SIGTERM', shutdown); process.once('SIGINT', shutdown);

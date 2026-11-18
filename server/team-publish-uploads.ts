@@ -9,6 +9,7 @@ import express, { type Request } from 'express';
 import type Database from 'better-sqlite3';
 import type { UserRow } from './db.js';
 import { HttpError, objectBody } from './validation.js';
+import { requireReceiptRecord } from './resource-files.js';
 import { publicationKey, TEAM_MAX_BYTES, teamJson, teamRoute } from './team-publications.js';
 
 const CHUNK_BYTES = 1024 * 1024;
@@ -32,8 +33,16 @@ export function createTeamPublishUploads(db: Database.Database, tempDir: string,
   ); CREATE INDEX IF NOT EXISTS team_upload_age ON team_publish_uploads(touched) WHERE result IS NULL;`);
   const findId = db.prepare('SELECT * FROM team_publish_uploads WHERE id=? AND user_id=?');
   const findKey = db.prepare('SELECT * FROM team_publish_uploads WHERE user_id=? AND key=?');
-  const status = (row: Row) => ({ uploadId: row.id, offset: row.offset, total: row.total, encoding: row.encoding,
-    ...(row.result ? { result: JSON.parse(row.result) as Published } : {}) });
+  function completed(row: Row): Published | undefined {
+    if (!row.result) return;
+    const published = JSON.parse(row.result) as Published;
+    requireReceiptRecord(db, published.id);
+    return published;
+  }
+  function status(row: Row) {
+    const result = completed(row);
+    return { uploadId: row.id, offset: row.offset, total: row.total, encoding: row.encoding, ...(result ? { result } : {}) };
+  }
   const busy = new Set<string>();
   let completeInProgress = false;
   let lastSweep = 0;
@@ -84,7 +93,7 @@ export function createTeamPublishUploads(db: Database.Database, tempDir: string,
   }));
   router.post('/:id/chunk', ...json, teamRoute(async (req, res) => {
     const next = await ownedOperation(req.params.id!, req.user!, async row => {
-      if (row.result) throw new HttpError(409, '发布上传已经完成，请重新查询上传状态');
+      if (completed(row)) throw new HttpError(409, '发布上传已经完成，请重新查询上传状态');
       const { offset, data } = objectBody(req.body);
       if (typeof offset !== 'number' || !Number.isSafeInteger(offset) || offset < 0 || offset % CHUNK_BYTES || offset >= row.total ||
           typeof data !== 'string' || !data.length || data.length > BASE64_CHUNK_BYTES || data.length % 4 || !base64.test(data)) throw new HttpError(400, '上传分块编码或偏移无效');
@@ -122,7 +131,8 @@ export function createTeamPublishUploads(db: Database.Database, tempDir: string,
     objectBody(req.body);
     const user = await authenticate(req, true);
     const result = await ownedOperation(req.params.id!, user, async row => {
-      if (row.result) return JSON.parse(row.result) as Published;
+      const prior = completed(row);
+      if (prior) return prior;
       if (row.offset !== row.total) throw new HttpError(409, '发布上传尚未完成');
       if (completeInProgress) throw new HttpError(429, '已有发布正在处理，请重试同一项');
       completeInProgress = true;
@@ -170,6 +180,7 @@ export function createTeamPublishUploads(db: Database.Database, tempDir: string,
         await rm(expanded, { force: true }).catch(error => console.error('清理解压暂存失败', error));
       }
     });
+    requireReceiptRecord(db, result.id);
     res.json(result);
   }));
   return router;

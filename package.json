@@ -1,6 +1,6 @@
 {
   "name": "model-library",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,6 +12,7 @@
     "test": "node --import tsx --test tests/platform.test.ts tests/uuid.test.ts tests/model-validation.test.ts"
   },
   "dependencies": {
+    "@zumer/snapdom": "3.8.0",
     "better-sqlite3": "^11.10.0",
     "es-module-lexer": "^3.0.5",
     "express": "^4.21.2",

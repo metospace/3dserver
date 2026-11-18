@@ -1,6 +1,7 @@
 import { createHash, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
 import type Database from 'better-sqlite3';
+import type { User } from '../src/contracts.js';
 import { publicUser, type UserRow } from './db.js';
 import { HttpError, text, objectBody } from './validation.js';
 
@@ -31,17 +32,29 @@ async function passwordMatches(password: string, encoded?: string): Promise<bool
 }
 
 export interface AuthRequest extends Request { user?: UserRow }
-export interface PasswordVerifier {
+interface OAuthSession { expiresTime: number; verify: () => Promise<void> }
+export interface TeamAuthHost {
   verifyPassword(req: Request, name: unknown, secret: unknown): Promise<UserRow>;
+  issueSession(req: Request, res: Response, user: UserRow, oauth?: OAuthSession): User;
 }
 
 export function createAuth(db: Database.Database) {
   const attempts = new Map<string, { count: number; until: number }>();
   const findUser = db.prepare('SELECT * FROM users WHERE username = ?');
+  db.exec(`CREATE TABLE IF NOT EXISTS management_oauth_sessions (
+    token_hash TEXT PRIMARY KEY REFERENCES sessions(token_hash) ON DELETE CASCADE
+  );`);
+  // The upstream credentials are deliberately process-local.
+  db.prepare('DELETE FROM sessions WHERE token_hash IN (SELECT token_hash FROM management_oauth_sessions)').run();
+  const oauthSessions = new Map<string, { verify: () => Promise<void>; checkedAt: number; expiresAt: number }>();
+  const dropSession = db.prepare('DELETE FROM sessions WHERE token_hash = ?');
+  const findSession = db.prepare(`SELECT u.*, o.token_hash IS NOT NULL AS oauth FROM users u JOIN sessions s ON s.user_id = u.id
+    LEFT JOIN management_oauth_sessions o ON o.token_hash = s.token_hash WHERE s.token_hash = ? AND s.expires_at > ?`);
   let activeHashes = 0;
   const prune = () => {
     const now = Date.now();
     db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now);
+    for (const [key, session] of oauthSessions) if (session.expiresAt <= now || !findSession.get(key, now)) oauthSessions.delete(key);
     for (const [key, value] of attempts) if (value.until <= now) attempts.delete(key);
   };
   prune();
@@ -83,22 +96,41 @@ export function createAuth(db: Database.Database) {
     return value && /^[a-f0-9]{64}$/.test(value) ? value : undefined;
   }
 
-  function issueSession(req: Request, res: Response, user: UserRow) {
+  function issueSession(req: Request, res: Response, user: UserRow, oauth?: OAuthSession) {
+    const now = Date.now(), expiresAt = oauth ? Math.min(now + 8 * 3600_000, oauth.expiresTime || Infinity) : now + SESSION_AGE;
+    if (expiresAt <= now) throw new HttpError(401, '协同登录已失效');
     const token = randomBytes(32).toString('hex');
-    const old = sessionToken(req);
+    const key = hashToken(token), oldToken = sessionToken(req), oldKey = oldToken && hashToken(oldToken);
     db.transaction(() => {
-      if (old) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashToken(old));
-      db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)').run(hashToken(token), user.id, Date.now() + SESSION_AGE);
+      if (oldKey) dropSession.run(oldKey);
+      db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)').run(key, user.id, expiresAt);
+      if (oauth) db.prepare('INSERT INTO management_oauth_sessions VALUES (?)').run(key);
     })();
-    res.cookie(COOKIE, token, { ...cookieOptions(req), maxAge: SESSION_AGE });
+    if (oldKey) oauthSessions.delete(oldKey);
+    if (oauth) oauthSessions.set(key, { verify: oauth.verify, checkedAt: now, expiresAt });
+    res.cookie(COOKIE, token, { ...cookieOptions(req), maxAge: expiresAt - now });
     return publicUser(user);
   }
 
-  function authenticate(req: AuthRequest, _res: Response, next: NextFunction) {
+  async function authenticate(req: AuthRequest, _res: Response, next: NextFunction) {
     try {
       const token = sessionToken(req);
       if (token) {
-        const user = db.prepare(`SELECT u.* FROM users u JOIN sessions s ON s.user_id = u.id WHERE s.token_hash = ? AND s.expires_at > ?`).get(hashToken(token), Date.now()) as UserRow | undefined;
+        const key = hashToken(token), now = Date.now();
+        let user = findSession.get(key, now) as (UserRow & { oauth: number }) | undefined;
+        if (user?.oauth && !(req.method === 'POST' && req.path === '/logout')) {
+          const session = oauthSessions.get(key);
+          if (!session) { dropSession.run(key); user = undefined; }
+          else if (now - session.checkedAt >= 5 * 60_000 || !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+            try { await session.verify(); }
+            catch (error) {
+              if (!(error instanceof HttpError) || (error.status !== 401 && error.status !== 403)) throw error;
+              dropSession.run(key); oauthSessions.delete(key);
+            }
+            user = findSession.get(key, Date.now()) as typeof user;
+            if (user) session.checkedAt = Date.now();
+          }
+        }
         if (user) req.user = user;
       }
       next();
@@ -148,7 +180,7 @@ export function createAuth(db: Database.Database) {
     },
     logout(req: Request, res: Response) {
       const token = sessionToken(req);
-      if (token) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashToken(token));
+      if (token) { const key = hashToken(token); dropSession.run(key); oauthSessions.delete(key); }
       res.clearCookie(COOKIE, cookieOptions(req));
     },
     limitSetup(req: Request) { throttle(req, '__setup__'); },

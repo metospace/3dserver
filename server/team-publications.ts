@@ -8,6 +8,7 @@ import express, { type Request, type Response } from 'express';
 import type { AuthRequest } from './auth.js';
 import type { UserRow } from './db.js';
 import { HttpError, objectBody, text } from './validation.js';
+import { requireReceiptRecord } from './resource-files.js';
 
 export const TEAM_MAX_BYTES = 500 * 1024 * 1024;
 const keyPattern = /^[a-zA-Z0-9-]{16,80}$/;
@@ -106,7 +107,10 @@ export function openTeamPublications(db: Database.Database, files: string, stagi
   const result = (user: string, key: string, fingerprint: string) => {
     const row = db.prepare('SELECT fingerprint,result FROM team_publication_receipts WHERE user_id=? AND key=?').get(user, key) as Receipt | undefined;
     if (row && row.fingerprint !== fingerprint) throw new HttpError(409, '重试标识已用于其他内容');
-    return row ? JSON.parse(row.result) as Published : undefined;
+    if (!row) return;
+    const published = JSON.parse(row.result) as Published;
+    requireReceiptRecord(db, published.id);
+    return published;
   };
   const fields = `r.id,r.kind,v.number AS version,p.name,p.description,v.created_at AS created,p.category_path AS categoryPath,
       (SELECT uploaded_by FROM versions WHERE record_id=r.id ORDER BY number LIMIT 1) AS owner`;
