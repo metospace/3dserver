@@ -42,6 +42,7 @@ export function createTeamApi(db: Database.Database, auth: TeamAuthHost, paths: 
   router.use(sessions.router, sessions.requireUser);
   router.get('/items', teamRoute((req, res) => res.json(publications.list(req.query.kind, req.query.q))));
   router.get('/items/:id/:version(\\d+)', teamRoute((req, res) => publications.read(req.params.id!, Number(req.params.version), res)));
+  router.get('/items/:id/:version(\\d+)/thumbnail', teamRoute((req, res) => publications.thumbnail(req.params.id!, Number(req.params.version), res)));
   // The legacy release posts one JSON request. Bound buffered completion work separately from chunks.
   let legacyInProgress = false;
   const reserveLegacy: RequestHandler = (req, res, next) => {
