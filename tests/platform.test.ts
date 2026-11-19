@@ -280,7 +280,7 @@ test('v1 migration preserves model identities, source bytes, history, sessions a
   }
 })
 
-interface TeamItem { id: string; version: number; kind: string; owner: string; name: string; categoryPath: string[]; payload?: unknown }
+interface TeamItem { id: string; version: number; kind: string; owner: string; name: string; description: string; categoryPath: string[]; sourceKind: string; payload?: unknown }
 interface TeamSession { token: string; user: { id: string; name: string; role: string } }
 async function teamRequest<T>(base: string, path: string, options: { token?: string; body?: unknown; status?: number; headers?: Record<string, string>; binary?: boolean } = {}) {
   const { token, body, status = 200, headers, binary } = options
@@ -297,6 +297,69 @@ async function teamRequest<T>(base: string, path: string, options: { token?: str
   assert.equal(response.status, status, `${path}: ${JSON.stringify(value)}`)
   return value as T
 }
+
+test('team items expose management GLB pointers, metadata, original bytes and thumbnails', { timeout: 60_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'team-management-glb-'))
+  let running: RunningServer | undefined
+  try {
+    running = await start(directory)
+    const { base } = running, manager = new Client(base)
+    await manager.request('/setup', 'POST', { username: 'admin', password: 'example-admin', displayName: '管理员' }, 201)
+    const { token } = await teamRequest<TeamSession>(base, 'login', { body: { name: 'admin', password: 'example-admin' } })
+    const parent = await manager.request<Category>('/categories', 'POST', { kind: 'asset', name: '设备', parentId: null }, 201)
+    const child = await manager.request<Category>('/categories', 'POST', { kind: 'asset', name: '水泵', parentId: parent.id }, 201)
+    const original = glb(), newer = glb({ extras: { revision: 2 } }), png = screenshotPng()
+    const asset = await manager.upload('/records', original, { kind: 'asset', name: '管理水泵', description: '独有说明', categoryId: child.id })
+    await manager.upload(`/versions/${asset.currentVersion.id}/thumbnail`, png, {}, 204, 'thumbnail.png')
+    let detail = await manager.request<Detail>(`/records/${asset.id}`)
+    const next = await manager.upload<Version>(`/records/${asset.id}/versions`, newer, { expectedRevision: String(detail.record.revision) })
+    detail = await manager.request<Detail>(`/records/${asset.id}`)
+    await manager.request(`/records/${asset.id}/current`, 'POST', { expectedRevision: detail.record.revision, versionId: asset.currentVersion.id }, 204)
+    const scene = await manager.upload('/records', newer, { kind: 'scene', name: '管理场景', description: '未分类场景' })
+    const dashboard = await manager.upload('/records', Buffer.from('<h1>看板</h1>'), { kind: 'dashboard', name: '管理看板' }, 201, 'index.html')
+    const assets = await teamRequest<TeamItem[]>(base, 'items?kind=asset&q=', { token })
+    assert.equal(assets.length, 1)
+    assert.deepEqual(assets.map(item => [item.id, item.version, item.sourceKind, item.name, item.description, item.categoryPath]), [
+      [asset.id, asset.currentVersion.number, 'glb', '管理水泵', '独有说明', ['设备', '水泵']],
+    ])
+    const scenes = await teamRequest<TeamItem[]>(base, 'items?kind=scene', { token })
+    assert.deepEqual(scenes.map(item => [item.id, item.version, item.sourceKind, item.name, item.description, item.categoryPath]), [
+      [scene.id, scene.currentVersion.number, 'glb', '管理场景', '未分类场景', []],
+    ])
+    assert.ok(!(await readdir(join(directory, 'files'))).some(name => name.endsWith('.json')))
+    assert.ok(![...assets, ...scenes].some(item => item.id === dashboard.id))
+    for (const query of ['管理水泵', '独有说明']) {
+      assert.deepEqual((await teamRequest<TeamItem[]>(base, `items?kind=asset&q=${encodeURIComponent(query)}`, { token })).map(item => item.id), [asset.id])
+    }
+    const route = `items/${asset.id}/${asset.currentVersion.number}`
+    assert.deepEqual(await teamRequest<Buffer>(base, route, { token, binary: true }), original)
+    assert.equal(original.length, asset.currentVersion.size)
+    const response = await fetch(`${base}/api/team/${route}`, { headers: { Authorization: `Bearer ${token}` } })
+    assert.equal(response.status, 200)
+    assert.match(response.headers.get('content-type') || '', /^(model\/gltf-binary|application\/octet-stream)(;|$)/)
+    assert.equal(response.headers.get('content-length'), String(asset.currentVersion.size))
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), original)
+    assert.deepEqual(await teamRequest<Buffer>(base, `items/${scene.id}/1`, { token, binary: true }), newer)
+    await teamRequest(base, `items/${asset.id}/${next.number}`, { token, status: 404 })
+    assert.deepEqual(await teamRequest<Buffer>(base, `${route}/thumbnail`, { token, binary: true }), png)
+    await teamRequest(base, `${route}/thumbnail`, { status: 401 })
+    await teamRequest(base, `items/${scene.id}/1/thumbnail`, { token, status: 404 })
+    await teamRequest(base, `items/${asset.id}/${next.number}/thumbnail`, { token, status: 404 })
+    await teamRequest(base, 'publish', { token, status: 404, body: {
+      key: randomUUID(), itemId: scene.id, expectedVersion: 1, kind: 'scene', name: '不可追加', description: '', categoryPath: [],
+      payload: { format: 'chat3d-project', version: 1, scene: { schemaVersion: 1, projectId: 'native', revision: 1, unit: 'm', upAxis: 'Y', nodes: [], materials: [], assets: [] } },
+    } })
+    detail = await manager.request<Detail>(`/records/${asset.id}`)
+    await manager.request(`/records/${asset.id}/archive`, 'PATCH', { archived: true, expectedRevision: detail.record.revision })
+    assert.deepEqual(await teamRequest(base, 'items?kind=asset', { token }), [])
+    await teamRequest(base, route, { token, status: 404 })
+    await teamRequest(base, `${route}/thumbnail`, { token, status: 404 })
+    assert.deepEqual((await teamRequest<TeamItem[]>(base, 'items?kind=scene', { token })).map(item => item.id), [scene.id])
+  } finally {
+    if (running) await stop(running.child)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
 
 test('Chat3D sessions, resumable publications and historical reads share the management library', { timeout: 60_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'chat3d-publications-'))
@@ -360,14 +423,19 @@ test('Chat3D sessions, resumable publications and historical reads share the man
     await teamRequest(base, 'publish', { token, body: { ...replacement, key: randomUUID() }, status: 409 })
     const rows = await teamRequest<TeamItem[]>(base, 'items?kind=scene', { token: viewer })
     assert.deepEqual(rows.map(row => [row.id, row.version, row.name]), [[second.id, 2, replacement.name]])
+    assert.equal(rows[0]!.sourceKind, 'chat3d')
     const fixed = await teamRequest<TeamItem>(base, `items/${first.id}/1`, { token: viewer })
     assert.deepEqual(fixed.categoryPath, ['车间', '装配线'])
     assert.deepEqual(fixed.payload, payload)
+    assert.equal(fixed.sourceKind, 'chat3d')
     const detail = await manager.request<Detail>(`/records/${first.id}`)
     assert.equal(detail.record.currentVersion.sourceKind, 'chat3d')
     assert.deepEqual(JSON.parse((await manager.binary(`/versions/${detail.versions[1]!.id}/source`)).toString()), payload)
     await manager.request(`/records/${first.id}/current`, 'POST', { expectedRevision: detail.record.revision, versionId: detail.versions[1]!.id }, 204)
-    assert.equal((await teamRequest<TeamItem[]>(base, 'items?kind=scene', { token: viewer }))[0]!.version, 2)
+    const rolledBack = await teamRequest<TeamItem[]>(base, 'items?kind=scene', { token: viewer })
+    assert.deepEqual(rolledBack.map(item => [item.id, item.version, item.name, item.categoryPath]), [[second.id, 2, replacement.name, ['车间', '装配线']]])
+    assert.deepEqual((await teamRequest<TeamItem>(base, `items/${first.id}/1`, { token: viewer })).payload, payload)
+    await teamRequest(base, `items/${first.id}/99`, { token: viewer, status: 404 })
     const third = await teamRequest<TeamItem>(base, 'publish', { token, body: { ...replacement, key: randomUUID(), expectedVersion: 2 } })
     assert.equal(third.version, 3)
     const beforeDelete = await manager.request<Detail>(`/records/${first.id}`)

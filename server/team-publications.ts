@@ -19,7 +19,7 @@ const thumbnailPattern = /^data:image\/(png|jpeg);base64,([a-zA-Z0-9+/]+={0,2})$
 interface Published { id: string; version: number }
 type ModelKind = 'asset' | 'scene';
 interface Publication { kind: ModelKind; name: string; description: string; itemId?: string; expectedVersion: number; key: string; categoryPath: string[]; payload: Record<string, unknown> }
-interface Item extends Published { owner: string; kind: ModelKind; name: string; description: string; created: string; categoryPath: string }
+interface Item extends Published { owner: string; kind: ModelKind; name: string; description: string; created: string; categoryPath: string; sourceKind: string }
 interface Receipt { fingerprint: string; result: string }
 
 function modelKind(kind: unknown): ModelKind {
@@ -112,12 +112,33 @@ export function openTeamPublications(db: Database.Database, files: string, stagi
     requireReceiptRecord(db, published.id);
     return published;
   };
-  const fields = `r.id,r.kind,v.number AS version,p.name,p.description,v.created_at AS created,p.category_path AS categoryPath,
+  const fields = `r.id,r.kind,v.number AS version,v.source_kind AS sourceKind,p.name,p.description,v.created_at AS created,p.category_path AS categoryPath,
       (SELECT uploaded_by FROM versions WHERE record_id=r.id ORDER BY number LIMIT 1) AS owner`;
   const from = 'FROM records r JOIN versions v ON v.record_id=r.id JOIN team_publication_versions p ON p.version_id=v.id';
   // The management page can select an older display version. Chat3D always
   // publishes against the newest immutable version, never against that pointer.
   const newest = 'v.number=(SELECT MAX(number) FROM versions WHERE record_id=r.id)';
+  const latestPublished = `EXISTS (SELECT 1 FROM versions latest JOIN team_publication_versions published ON published.version_id=latest.id
+    WHERE latest.record_id=r.id AND latest.number=(SELECT MAX(number) FROM versions WHERE record_id=r.id))`;
+  const visibleFrom = `FROM records r JOIN versions v ON v.record_id=r.id
+    LEFT JOIN team_publication_versions p ON p.version_id=v.id
+    LEFT JOIN categories c ON c.id=r.category_id LEFT JOIN categories parent ON parent.id=c.parent_id`;
+  const visibleFields = `r.id,r.kind,v.number AS version,v.source_kind AS sourceKind,
+    CASE WHEN p.version_id IS NOT NULL THEN p.name ELSE r.name END AS name,
+    CASE WHEN p.version_id IS NOT NULL THEN p.description ELSE r.description END AS description,
+    v.created_at AS created,CASE WHEN p.version_id IS NOT NULL THEN p.category_path
+      WHEN c.id IS NULL THEN '[]' WHEN parent.id IS NULL THEN json_array(c.name) ELSE json_array(parent.name,c.name) END AS categoryPath,
+    (SELECT uploaded_by FROM versions WHERE record_id=r.id ORDER BY number LIMIT 1) AS owner`;
+  const managementVisible = `NOT (${latestPublished}) AND v.id=r.current_version_id`;
+  function visibleVersion(id: string, version: number) {
+    if (!idPattern.test(id) || !Number.isSafeInteger(version) || version < 1) throw new HttpError(404, '找不到发布版本');
+    const row = db.prepare(`SELECT v.id AS versionId,v.size,v.has_thumbnail AS hasThumbnail,v.thumbnail_path AS thumbnailPath,
+      ${visibleFields} ${visibleFrom} WHERE r.id=? AND v.number=? AND r.kind IN ('asset','scene') AND r.archived=0
+      AND (p.version_id IS NOT NULL OR (${managementVisible}))`).get(id, version) as
+      (Item & { versionId: string; size: number; hasThumbnail: number; thumbnailPath: string | null }) | undefined;
+    if (!row) throw new HttpError(404, '找不到发布版本');
+    return row;
+  }
   const dto = ({ categoryPath, ...row }: Item) => ({ ...row, categoryPath: JSON.parse(categoryPath) as string[] });
   function categoryIdFor(kind: ModelKind, categoryPath: string[]) {
     let parent: string | null = null;
@@ -201,19 +222,24 @@ export function openTeamPublications(db: Database.Database, files: string, stagi
     publish,
     list(kind: unknown, q: unknown) {
       const search = text(q, '搜索内容', 200);
-      const rows = db.prepare(`SELECT ${fields} ${from} WHERE r.kind=? AND r.archived=0 AND ${newest} AND
-        (instr(lower(p.name),lower(?))>0 OR instr(lower(p.description),lower(?))>0)
+      const rows = db.prepare(`SELECT ${visibleFields} ${visibleFrom} WHERE r.kind=? AND r.archived=0
+        AND ((p.version_id IS NOT NULL AND ${newest}) OR (${managementVisible}))
+        AND (instr(lower(CASE WHEN p.version_id IS NOT NULL THEN p.name ELSE r.name END),lower(?))>0
+          OR instr(lower(CASE WHEN p.version_id IS NOT NULL THEN p.description ELSE r.description END),lower(?))>0)
         ORDER BY v.created_at DESC,r.id LIMIT 500`).all(modelKind(kind), search, search) as Item[];
       return rows.map(dto);
     },
     async read(id: string, version: number, res: Response) {
-      if (!idPattern.test(id) || !Number.isSafeInteger(version) || version < 1) throw new HttpError(404, '找不到发布版本');
-      const row = db.prepare(`SELECT v.id AS versionId,v.size,${fields} ${from} WHERE r.id=? AND v.number=?`).get(id, version) as (Item & { versionId: string; size: number }) | undefined;
-      if (!row) throw new HttpError(404, '找不到发布版本');
-      const { versionId, size, ...item } = row;
-      const input = await open(path.join(files, `${versionId}.json`), 'r');
+      const { versionId, size, hasThumbnail, thumbnailPath, ...item } = visibleVersion(id, version);
+      if (item.sourceKind !== 'glb' && item.sourceKind !== 'chat3d') throw new HttpError(404, '找不到发布版本');
+      const input = await open(path.join(files, `${versionId}.${item.sourceKind === 'glb' ? 'glb' : 'json'}`), 'r');
       try {
-        if ((await input.stat()).size !== size) throw new Error('Chat3D snapshot byte length mismatch');
+        if ((await input.stat()).size !== size) throw new Error('Team resource byte length mismatch');
+        if (item.sourceKind === 'glb') {
+          res.type('model/gltf-binary').set('Content-Length', String(size));
+          await pipeline(input.createReadStream({ autoClose: false }), res);
+          return;
+        }
         const prefix = `${JSON.stringify(dto(item)).slice(0, -1)},"payload":`;
         res.type('json').set('Content-Length', String(Buffer.byteLength(prefix) + size + 1));
         async function* responseBody() {
@@ -223,6 +249,15 @@ export function openTeamPublications(db: Database.Database, files: string, stagi
         }
         await pipeline(Readable.from(responseBody()), res);
       } finally { await input.close(); }
+    },
+    async thumbnail(id: string, version: number, res: Response) {
+      const row = visibleVersion(id, version);
+      if (!row.hasThumbnail) throw new HttpError(404, '缩略图不存在');
+      const filename = row.thumbnailPath ?? `${row.versionId}.png`;
+      res.type(filename.endsWith('.jpg') ? 'image/jpeg' : 'image/png');
+      const { promise, resolve, reject } = Promise.withResolvers<void>();
+      res.sendFile(path.resolve(files, filename), error => error ? reject(error) : resolve());
+      await promise;
     },
   };
 }
